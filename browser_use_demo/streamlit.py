@@ -487,25 +487,27 @@ def render_artifacts_panel(run_dir):
 @st.fragment(run_every="2s")
 def render_sub_browser_panel(run_dir):
     """Right-column panel for the sub-browser screenshot queue (see
-    tools/sub_browser_queue.py) - the queue_screenshots/queue_status/etc.
-    tools' shared state, read here for display only (never mutated by this
-    function beyond the pump() call below).
+    tools/sub_browser_queue.py) - a live grid of what each currently-running
+    sub-browser page actually looks like right now, for watching the fanout
+    happen (legibility/debugging), not a post-hoc results gallery. The
+    coordinator's own browser is watchable live via VNC, but VNC only shows
+    whichever tab is focused - it can't show several concurrent sub-browser
+    pages at once, which is the actual gap this fills.
 
     st.fragment(run_every="2s") makes this refresh on its own, independent
-    of chat activity, WITHOUT rerunning the rest of the page - the piece
-    that makes results feel "live" rather than only updating on the next
-    message. Every tick, this actually drives the session's shared event
-    loop forward via pump_async (NOT just a bare sync call) - a plain
-    asyncio.create_task only schedules an item's work, it doesn't run it,
-    and nothing else keeps this loop spinning once the agent turn that
-    queued the items has ended - see SubBrowserQueue.pump_async's
-    docstring. Must be the SAME loop the coordinator's own BrowserTool
-    (and its Playwright connection) already runs on - get_or_create_event_loop,
-    not a fresh one - or Playwright raises a cross-loop error.
+    of chat activity, WITHOUT rerunning the rest of the page. Every tick,
+    this actually drives the session's shared event loop forward via
+    pump_and_preview (NOT just a bare sync call) - a plain asyncio.create_task
+    only schedules an item's work, it doesn't run it, and nothing else keeps
+    this loop spinning once the agent turn that queued the items has ended -
+    see SubBrowserQueue.pump_async's docstring. Must be the SAME loop the
+    coordinator's own BrowserTool (and its Playwright connection) already
+    runs on - get_or_create_event_loop, not a fresh one - or Playwright
+    raises a cross-loop error.
     """
     queue = st.session_state.sub_browser_queue
     loop = get_or_create_event_loop()
-    loop.run_until_complete(queue.pump_async())
+    previews = loop.run_until_complete(queue.pump_and_preview())
     snap = queue.snapshot()
 
     st.subheader("🧪 Sub-browser Queue")
@@ -514,21 +516,20 @@ def render_sub_browser_panel(run_dir):
         status_bits.append("⏸ paused")
     st.caption(" · ".join(status_bits))
 
-    if not snap["completed"]:
-        st.info("No results yet - ask the agent to queue some screenshots.", icon="🧪")
-        return
+    if not previews:
+        st.info("No sub-browsers running right now - ask the agent to queue some screenshots.", icon="🧪")
+    else:
+        cols = st.columns(2)
+        for i, (item_id, b64_jpeg) in enumerate(previews.items()):
+            with cols[i % len(cols)]:
+                st.image(base64.b64decode(b64_jpeg), caption=item_id, use_container_width=True)
 
-    for item in snap["completed"]:
-        icon = "✅" if item["status"] == "done" else "⚠️"
-        with st.expander(f"{icon} {item['id']}", expanded=False):
-            for filename in item["screenshots"]:
-                path = run_dir / filename
-                if path.exists():
-                    st.image(str(path), caption=filename)
-            if item.get("error"):
-                st.error(item["error"])
-            if item["log"]:
-                st.code("\n".join(item["log"]))
+    if snap["completed"]:
+        with st.expander(f"Finished ({len(snap['completed'])})", expanded=False):
+            for item in snap["completed"][:20]:
+                icon = "✅" if item["status"] == "done" else "⚠️"
+                detail = f"{len(item['screenshots'])} screenshot(s)" if item["status"] == "done" else item["error"]
+                st.caption(f"{icon} {item['id']} — {detail}")
 
 
 def authenticate():
@@ -813,8 +814,8 @@ def main():
             step=1,
             key="max_subbrowser_fanout",
             help=(
-                "How many queue_screenshots items run concurrently at once. Results "
-                "appear in the panel to the right of the chat as they finish."
+                "How many queue_screenshots items run concurrently at once. Watch them "
+                "live in the panel to the right of the chat."
             ),
         )
         st.session_state.sub_browser_queue.max_fanout = st.session_state.max_subbrowser_fanout

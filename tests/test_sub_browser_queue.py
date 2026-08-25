@@ -67,7 +67,17 @@ def make_fake_page(*, goto_side_effect=None, scroll_side_effect=None):
     text_locator.first = locator
     page.get_by_text = MagicMock(return_value=text_locator)
 
-    page.screenshot = AsyncMock(side_effect=lambda path, **kw: Path(path).write_bytes(b"\x89PNG\r\n" + b"0" * 100))
+    def default_screenshot(path=None, **kw):
+        # Playwright's real page.screenshot() always returns the image
+        # bytes, writing to disk too only when `path` is given - the
+        # `screenshot` step calls it with path= (capture_screenshot), the
+        # live-preview capture calls it without one (just wants bytes back).
+        data = b"\x89PNG\r\n" + b"0" * 100
+        if path:
+            Path(path).write_bytes(data)
+        return data
+
+    page.screenshot = AsyncMock(side_effect=default_screenshot)
     page.close = AsyncMock()
     return page
 
@@ -270,6 +280,101 @@ class TestConcurrency:
         queue.add([[{"action": "navigate", "url": f"example.com/{i}"}] for i in range(3)])
         await drain(queue)
         assert len(queue.snapshot()["completed"]) == 3
+
+
+class TestLivePreviews:
+    """capture_live_previews/pump_and_preview - the live grid the Streamlit
+    panel renders, distinct from the `screenshot` step's saved deliverable
+    files (never written to disk, purely for watching a page currently in
+    progress)."""
+
+    @pytest.mark.asyncio
+    async def test_empty_queue_returns_no_previews(self, tmp_path):
+        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path)
+        assert await queue.capture_live_previews() == {}
+
+    @pytest.mark.asyncio
+    async def test_in_progress_item_has_a_live_preview(self, tmp_path):
+        gate = asyncio.Event()
+
+        async def blocking_goto(url, **kwargs):
+            await gate.wait()
+            return MagicMock(status=200, headers={})
+
+        bt = make_browser_tool(tmp_path, page_factory=lambda: make_fake_page(goto_side_effect=blocking_goto))
+        queue = SubBrowserQueue(browser_tool=bt, run_dir=tmp_path)
+        [item_id] = queue.add([[{"action": "navigate", "url": "example.com"}]])
+
+        # Give _run_item a chance to open its page and register it as live,
+        # without letting the (gated) navigate step finish.
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + 2.0
+        while item_id not in queue._live_pages and loop.time() < deadline:
+            await asyncio.sleep(0.01)
+        assert item_id in queue._live_pages, "page was never registered as live"
+
+        previews = await queue.capture_live_previews()
+        assert list(previews.keys()) == [item_id]
+        assert previews[item_id]  # non-empty base64 string
+
+        gate.set()
+        await drain(queue)
+        # Finished items don't linger in the live grid.
+        assert await queue.capture_live_previews() == {}
+
+    @pytest.mark.asyncio
+    async def test_screenshot_failure_is_skipped_not_raised(self, tmp_path):
+        gate = asyncio.Event()
+
+        async def blocking_goto(url, **kwargs):
+            await gate.wait()
+            return MagicMock(status=200, headers={})
+
+        page = make_fake_page(goto_side_effect=blocking_goto)
+        page.screenshot = AsyncMock(side_effect=RuntimeError("page is navigating"))
+        bt = make_browser_tool(tmp_path, page_factory=lambda: page)
+        queue = SubBrowserQueue(browser_tool=bt, run_dir=tmp_path)
+        queue.add([[{"action": "navigate", "url": "example.com"}]])
+
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + 2.0
+        while not queue._live_pages and loop.time() < deadline:
+            await asyncio.sleep(0.01)
+
+        previews = await queue.capture_live_previews()
+        assert previews == {}  # failed capture skipped, not raised
+
+        gate.set()
+        await drain(queue)
+
+    @pytest.mark.asyncio
+    async def test_pump_and_preview_advances_and_returns_previews(self, tmp_path):
+        gate = asyncio.Event()
+
+        async def blocking_goto(url, **kwargs):
+            await gate.wait()
+            return MagicMock(status=200, headers={})
+
+        bt = make_browser_tool(tmp_path, page_factory=lambda: make_fake_page(goto_side_effect=blocking_goto))
+        queue = SubBrowserQueue(browser_tool=bt, run_dir=tmp_path, max_fanout=1)
+        queue.pause()
+        queue.add([[{"action": "navigate", "url": "example.com"}]])
+
+        # Paused: pump_and_preview shouldn't start it, so there's nothing
+        # live to preview yet.
+        previews = await queue.pump_and_preview(budget_s=0.05)
+        assert previews == {}
+
+        queue.resume()
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + 2.0
+        while not queue._live_pages and loop.time() < deadline:
+            await asyncio.sleep(0.01)
+        previews = await queue.pump_and_preview(budget_s=0.05)
+        assert len(previews) == 1
+
+        gate.set()
+        await drain(queue)
 
 
 class TestPauseResumeClear:

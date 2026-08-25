@@ -11,8 +11,16 @@ screenshot" / "visit Z, full-page screenshot") into the queue via
 queue_screenshots and gets item ids back immediately - it does not wait for
 them. Items are picked up and run concurrently, up to max_fanout at a time,
 each against its own fresh Page. Results (screenshots + a log) collect as
-items finish, queryable via queue_status, and also rendered live in the
-Streamlit sidebar panel (see streamlit.py's render_sub_browser_panel).
+items finish, queryable via queue_status.
+
+The human-facing side prioritizes watching the fanout happen over reviewing
+it afterward - the coordinator's own browser runs headful (see browser.py's
+_ensure_browser, headless=False) precisely so a human can watch it live via
+VNC, but VNC only shows whichever tab is focused, so it can't show several
+concurrent sub-browser pages at once. capture_live_previews grabs a fresh,
+ephemeral (never saved to disk) screenshot of every currently in-progress
+item's page on every UI tick instead - see streamlit.py's
+render_sub_browser_panel, which renders these as a live grid.
 
 Concurrency model: everything runs on ONE asyncio event loop - the same one
 Streamlit's session already drives (st.session_state.event_loop) - rather
@@ -30,6 +38,7 @@ chat turn is active, not just while the agent happens to be mid-turn.
 """
 
 import asyncio
+import base64
 import re
 import uuid
 from typing import Any, Optional
@@ -63,6 +72,13 @@ class SubBrowserQueue:
         self._pending: list[dict[str, Any]] = []
         self._in_progress: dict[str, dict[str, Any]] = {}
         self._completed: list[dict[str, Any]] = []  # most-recent-first, capped
+        # Live Page objects for currently-running items, keyed by item id -
+        # for the UI's live preview grid (capture_live_previews). Separate
+        # from `screenshots` above: those are deliberate, requested `screenshot`
+        # steps saved to disk as deliverables; these are ephemeral, in-memory-
+        # only snapshots of "what does this page look like right now," purely
+        # for watching the fanout happen, never written to disk.
+        self._live_pages: dict[str, Any] = {}
 
     def add(self, items: list[list[dict[str, Any]]]) -> list[str]:
         """Enqueue items (each a list of steps) and return their ids
@@ -122,6 +138,38 @@ class SubBrowserQueue:
         await asyncio.sleep(budget_s)
         self._kick_off_more()
 
+    async def capture_live_previews(self) -> dict[str, str]:
+        """Best-effort live screenshot (base64 JPEG) of every currently
+        in-progress item's page - purely for the UI's live grid, watching
+        the fanout as it happens. Never saved to disk (see _live_pages'
+        docstring for why this is a distinct concept from the `screenshot`
+        step's deliverable files). Captured concurrently, not sequentially,
+        so N active pages don't serialize into N x screenshot-latency each
+        tick. A page mid-navigation can transiently fail to screenshot -
+        skipped for that tick, not surfaced as an item error (this is only
+        a preview; the item's own step results are unaffected)."""
+
+        async def _one(item_id: str, page) -> tuple[str, Optional[str]]:
+            try:
+                data = await page.screenshot(type="jpeg", quality=50, timeout=2000)
+                return item_id, base64.b64encode(data).decode()
+            except Exception:
+                return item_id, None
+
+        if not self._live_pages:
+            return {}
+        pairs = await asyncio.gather(
+            *(_one(item_id, page) for item_id, page in list(self._live_pages.items()))
+        )
+        return {item_id: b64 for item_id, b64 in pairs if b64}
+
+    async def pump_and_preview(self, budget_s: float = 0.3) -> dict[str, str]:
+        """Convenience for the UI's single per-tick call: advance the queue,
+        then grab live previews of whatever's running now - one
+        run_until_complete from the caller instead of two."""
+        await self.pump_async(budget_s)
+        return await self.capture_live_previews()
+
     def _kick_off_more(self) -> None:
         if self.paused:
             return
@@ -148,6 +196,7 @@ class SubBrowserQueue:
             self._finish_item(item["id"], result)
             return
 
+        self._live_pages[item["id"]] = page
         try:
             await page.set_viewport_size({"width": self.browser_tool.width, "height": self.browser_tool.height})
             for step in item["steps"]:
@@ -157,6 +206,7 @@ class SubBrowserQueue:
             result["error"] = str(e)
             result["log"].append(f"error: {e}")
         finally:
+            self._live_pages.pop(item["id"], None)
             await page.close()
             self._finish_item(item["id"], result)
 
@@ -226,11 +276,11 @@ QUEUE_SCREENSHOTS_DESCRIPTION = (
     "Add one or more instruction sequences to the sub-browser screenshot queue for visual "
     "reconnaissance across many pages/sites at once - returns immediately with the queued "
     "item ids, it does NOT wait for them to finish. Items run concurrently, up to the fanout "
-    "limit set in the sidebar (default 8), each against its own independent page. Results "
-    "(screenshots + a log) appear live in the sidebar panel as items complete, and via "
-    "queue_status. Use this instead of navigating/screenshotting many pages yourself one at "
-    "a time; it's not for interaction or reasoning (clicking, forms) - just navigate, scroll "
-    "to something, and capture."
+    "limit set in the sidebar (default 8), each against its own independent page - the user "
+    "can watch them working live in a panel next to the chat. Results (screenshots + a log) "
+    "are queryable via queue_status once an item finishes. Use this instead of navigating/"
+    "screenshotting many pages yourself one at a time; it's not for interaction or reasoning "
+    "(clicking, forms) - just navigate, scroll to something, and capture."
 )
 
 QUEUE_STATUS_DESCRIPTION = (
