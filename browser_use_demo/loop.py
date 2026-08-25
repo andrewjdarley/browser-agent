@@ -18,6 +18,7 @@ from .model_config import resolve as resolve_model
 from .run_logger import RunLogger
 from .tools import BrowserTool, FileOutputTool
 from .tools.batch_extract import BatchExtractTool, build_batch_extract_tool_fn
+from .tools.script_runner import ScriptRunnerTool, build_run_script_tool_fn
 from .tools.subagent import DispatchSubagentsTool, build_dispatch_subagents_tool_fn
 from .tools.verify import MAX_VERIFICATIONS_PER_SESSION, VerifyFindingTool, build_verify_finding_tool_fn
 
@@ -44,7 +45,9 @@ When you have a batch of items that genuinely need per-item reasoning or interac
 
 Don't scroll blindly in small increments to explore a page. If you don't already know exactly where your target is, call read_page (or re-check it) to find an element ref, or scroll_to a major structural landmark (a section heading, a "load more" control, etc.) and look at what's there - then decide your next move from what you actually see. Only use plain directional scroll when you're confident you're already close to the target and it'll take at most one or two calls to get there. If you're scrolling repeatedly without a specific ref in mind, stop and look at the DOM instead.
 
-If a task involves several similar items and manually repeating the same steps on each would clearly take many tool calls, script it instead - this is a normal, common solution, not a last resort. Whether that's worth it depends on per-item effort as much as item count: even 5-10 items can be worth scripting if each requires several steps by hand. First inspect one example page to work out the extraction logic. Iterating on the extraction JS - try it, look at what came back, fix it, try again - against that one page before applying it to the rest is expected; don't expect to get it right in one attempt. Default to batch_extract for concurrent multi-URL fetching, same-origin or not - it fetches many URLs concurrently (reusing your logged-in session, with built-in backoff if a site starts rate-limiting you) and runs your extraction JS against each one, isolated from whatever page you currently happen to be on. Writing your own execute_js fetch() + Promise.all loop instead is not just narrower (same-origin only) - it also depends on the current page's own context, which can silently and unpredictably break it: fetch() calls have been observed failing outright (not from rate-limiting - a hard "Failed to fetch" on every request) when run from a page a browser renders specially, like a raw JSON API response. Reach for a manual fetch loop only when you specifically need it to run against the live current page's own state (e.g. an authenticated fetch that must reuse in-page JS variables). batch_extract only sees server-rendered HTML, not content that appears after client-side JS runs - if the data you need isn't in the raw page source, try network_list/network_inspect first to find the JSON endpoint actually behind it (often hittable directly, still cheap), and fall back to dispatch_subagents or manual navigation only if that doesn't turn up anything.
+If a task involves several similar items and manually repeating the same steps on each would clearly take many tool calls, script it instead - this is a normal, common solution, not a last resort. Whether that's worth it depends on per-item effort as much as item count: even 5-10 items can be worth scripting if each requires several steps by hand. First inspect one example page/item manually to work out the recipe. Iterating on it - try it, look at what came back, fix it, try again - against that one example before applying it to the rest is expected; don't expect to get it right in one attempt.
+
+Default to run_script for this: it replays a fixed sequence of steps (same action names as this tool - navigate, screenshot, get_page_text, execute_js, wait) once per item, over a pool of pages from your current session (inherits cookies/login), with no LLM cost per item. Whether it fetches or renders falls out of what you put in the script, not a separate choice: a script with no navigate step fetches each item as a URL via raw HTTP (fast, but only sees server-rendered HTML, not content that appears after client-side JS runs - same mechanism and same limitation as batch_extract, since that's literally what this is under the hood); a script that starts with navigate gets a real rendered page per item, so screenshot/get_page_text/JS that depends on client-rendering all work. batch_extract still exists as a narrower standalone tool for the fetch-only case if you prefer it, but run_script covers everything it does plus the render+screenshot case in one place. If the data you need isn't in a page's raw source and you don't want to pay render cost per item, try network_list/network_inspect first to find the JSON endpoint actually behind it (often hittable directly, still cheap) - the browser tool's execute_js fetch() + Promise.all is also an option for same-origin bulk calls against the CURRENT page specifically (not run_script's per-item pages), but depends on that page's own context in ways that can silently break (fetch() has been observed failing outright - a hard "Failed to fetch" on every request - when run from a page a browser renders specially, like a raw JSON API response). None of these tools support real per-item interaction or judgment (forms, multi-step flows, deciding what to click) - that's still dispatch_subagents.
 
 When you need to hand the user a deliverable file (a CSV, a report, extracted data), use the save_file tool. Don't try to trigger a browser download via execute_js - that saves inside the automated browser's own environment, not somewhere the user can find it.
 
@@ -95,6 +98,10 @@ def build_options(
         browser_tool=browser_tool,
         file_output_tool=file_output_tool,
     )
+    script_runner_tool = ScriptRunnerTool(
+        browser_tool=browser_tool,
+        file_output_tool=file_output_tool,
+    )
     verify_finding_tool = VerifyFindingTool(
         run_dir=browser_tool.run_dir,
         run_logger=run_logger,
@@ -108,6 +115,7 @@ def build_options(
         extra_tools=[
             build_dispatch_subagents_tool_fn(dispatch_subagents_tool),
             build_batch_extract_tool_fn(batch_extract_tool),
+            build_run_script_tool_fn(script_runner_tool),
             build_verify_finding_tool_fn(verify_finding_tool),
         ],
     )
@@ -133,6 +141,7 @@ def build_options(
             "mcp__browser_use__save_file",
             "mcp__browser_use__dispatch_subagents",
             "mcp__browser_use__batch_extract",
+            "mcp__browser_use__run_script",
             "mcp__browser_use__verify_finding",
         ],
         max_turns=max_turns,

@@ -269,6 +269,126 @@ DOM_MUTATING_ACTIONS = frozenset(
 DOM_DIFF_MAX_CHARS = 6000
 
 
+async def wait_for_page_ready(
+    page: Page,
+    *,
+    timeout_s: float = 3.0,
+    poll_interval: float = 0.3,
+    settle_delay_s: float = SCREENSHOT_SETTLE_DELAY_S,
+) -> None:
+    """Check whether a page has actually finished loading before reading it
+    (screenshot, text, JS); if not, wait briefly and re-check rather than
+    capturing a half-loaded page. Gives up after timeout_s - reading a
+    still-loading (or frozen) page is still better than not reading at all.
+
+    Wrapped in a hard asyncio.wait_for: if the page is genuinely frozen (JS
+    engine stuck, a blocking native dialog, etc.) a single page.evaluate()
+    call can hang indefinitely, which the elapsed-time bookkeeping alone
+    wouldn't catch - the outer timeout guarantees this always returns.
+
+    readyState alone isn't enough (see SCREENSHOT_SETTLE_DELAY_S) - after the
+    poll gives up or succeeds, wait settle_delay_s more before returning, so
+    the caller's read has a better chance of seeing actually-painted/settled
+    content. Factored out to take a Page directly (not self._page) so
+    tools/script_runner.py can reuse it for the per-item pages it drives
+    outside BrowserTool's own single-page session - see capture_screenshot
+    just below for the same reasoning.
+    """
+
+    async def _poll() -> None:
+        while True:
+            ready_state = await page.evaluate("document.readyState")
+            if ready_state == "complete":
+                return
+            await asyncio.sleep(poll_interval)
+
+    try:
+        await asyncio.wait_for(_poll(), timeout=timeout_s)
+    except Exception:
+        pass  # still loading, frozen, or navigated away mid-check - fall through
+
+    if settle_delay_s:
+        await asyncio.sleep(settle_delay_s)
+
+
+async def capture_screenshot(
+    page: Page, run_dir: Path, *, width: int, height: int, full_page: bool = False
+) -> ToolResult:
+    """Take a screenshot of a given Page and save it into run_dir, with the
+    same oversized-capture fallback chain BrowserTool._take_screenshot always
+    used: full page -> clipped to the top N viewports -> plain viewport,
+    whichever first comes in under MAX_SCREENSHOT_RAW_BYTES.
+
+    Factored out to take a Page (not self._page) so it's reusable by
+    anything that runs its own pages outside BrowserTool's single-page
+    session - see tools/script_runner.py, which runs one Page per item
+    concurrently and can't share BrowserTool's page across those.
+
+    Caller is responsible for any page-ready wait - this only captures.
+    """
+    try:
+        if full_page:
+            page_height = await page.evaluate("document.documentElement.scrollHeight")
+            if page_height > MAX_FULL_PAGE_HEIGHT_PX:
+                raise ToolError(
+                    f"Page is too tall for a full-page screenshot "
+                    f"({page_height}px > {MAX_FULL_PAGE_HEIGHT_PX}px limit, "
+                    f"likely an infinite-scroll page). Use scroll or "
+                    f"get_page_text instead."
+                )
+
+        screenshot_path = run_dir / f"screenshot_{uuid4().hex}.png"
+        truncation_note = ""
+        saved_note = f"Screenshot saved as {screenshot_path.name}\n"
+
+        if full_page:
+            await asyncio.wait_for(
+                page.screenshot(path=str(screenshot_path), full_page=True),
+                timeout=FULL_PAGE_SCREENSHOT_TIMEOUT_S,
+            )
+            if screenshot_path.stat().st_size > MAX_SCREENSHOT_RAW_BYTES:
+                clip_height = min(height * FULL_PAGE_FALLBACK_VIEWPORTS, page_height)
+                await page.screenshot(
+                    path=str(screenshot_path),
+                    clip={"x": 0, "y": 0, "width": width, "height": clip_height},
+                )
+                if screenshot_path.stat().st_size > MAX_SCREENSHOT_RAW_BYTES:
+                    # Still too big (rare - very dense visual content).
+                    # Fall back to a plain viewport screenshot, guaranteed small.
+                    await page.screenshot(path=str(screenshot_path), full_page=False)
+                    truncation_note = (
+                        "Note: this page was too large to capture in full even "
+                        "when clipped - showing only the current viewport. Use "
+                        "scroll or get_page_text for the rest of the page.\n"
+                    )
+                else:
+                    truncation_note = (
+                        f"Note: the full page was too large to send in one "
+                        f"screenshot, so this shows only the top {clip_height}px "
+                        f"(the part most likely to matter - headers, summaries, "
+                        f"metadata). Use scroll or get_page_text for content "
+                        f"further down the page.\n"
+                    )
+        else:
+            await page.screenshot(path=str(screenshot_path), full_page=False)
+
+        # Read the file and encode to base64
+        screenshot_bytes = screenshot_path.read_bytes()
+        image_base64 = base64.b64encode(screenshot_bytes).decode()
+
+        return ToolResult(output=saved_note + truncation_note, error=None, base64_image=image_base64)
+    except ToolError:
+        raise
+    except asyncio.TimeoutError as e:
+        raise ToolError(
+            f"Full-page screenshot timed out after "
+            f"{FULL_PAGE_SCREENSHOT_TIMEOUT_S}s (page may be lazy-loading "
+            f"content indefinitely). Use scroll or get_page_text instead."
+        ) from e
+    except Exception as e:
+        raise ToolError(f"Failed to take screenshot: {str(e)}") from e
+
+
 class BrowserTool:
     """
     A browser automation tool using Playwright for web interaction.
@@ -475,39 +595,14 @@ class BrowserTool:
         poll_interval: float = 0.3,
         settle_delay_s: float = SCREENSHOT_SETTLE_DELAY_S,
     ) -> None:
-        """Check whether the page has actually finished loading before a
-        screenshot; if not, wait briefly and re-check rather than capturing a
-        half-loaded page. Gives up after timeout_s - a screenshot of a
-        still-loading (or frozen) page is still better than no screenshot.
-
-        Wrapped in a hard asyncio.wait_for: if the page is genuinely frozen
-        (JS engine stuck, a blocking native dialog, etc.) a single
-        page.evaluate() call can hang indefinitely, which the elapsed-time
-        bookkeeping alone wouldn't catch - the outer timeout guarantees this
-        always returns.
-
-        readyState alone isn't enough (see SCREENSHOT_SETTLE_DELAY_S) - after
-        the poll gives up or succeeds, wait settle_delay_s more before
-        returning, so the caller's screenshot has a better chance of showing
-        actually-painted content.
-        """
+        """See wait_for_page_ready (module-level) - this is a thin wrapper
+        bound to self._page, kept so existing call sites don't all need a
+        page argument."""
         if self._page is None:
             return
-
-        async def _poll() -> None:
-            while True:
-                ready_state = await self._page.evaluate("document.readyState")
-                if ready_state == "complete":
-                    return
-                await asyncio.sleep(poll_interval)
-
-        try:
-            await asyncio.wait_for(_poll(), timeout=timeout_s)
-        except Exception:
-            pass  # still loading, frozen, or navigated away mid-check - fall through
-
-        if settle_delay_s:
-            await asyncio.sleep(settle_delay_s)
+        await wait_for_page_ready(
+            self._page, timeout_s=timeout_s, poll_interval=poll_interval, settle_delay_s=settle_delay_s
+        )
 
     async def _take_screenshot(self, full_page: bool = False) -> ToolResult:
         """
@@ -517,72 +612,10 @@ class BrowserTool:
         """
         if self._page is None:
             raise ToolError("Browser not initialized")
-
-        try:
-            await self._wait_for_page_ready()
-
-            if full_page:
-                page_height = await self._page.evaluate(
-                    "document.documentElement.scrollHeight"
-                )
-                if page_height > MAX_FULL_PAGE_HEIGHT_PX:
-                    raise ToolError(
-                        f"Page is too tall for a full-page screenshot "
-                        f"({page_height}px > {MAX_FULL_PAGE_HEIGHT_PX}px limit, "
-                        f"likely an infinite-scroll page). Use scroll or "
-                        f"get_page_text instead."
-                    )
-
-            screenshot_path = self.run_dir / f"screenshot_{uuid4().hex}.png"
-            truncation_note = ""
-            saved_note = f"Screenshot saved as {screenshot_path.name}\n"
-
-            if full_page:
-                await asyncio.wait_for(
-                    self._page.screenshot(path=str(screenshot_path), full_page=True),
-                    timeout=FULL_PAGE_SCREENSHOT_TIMEOUT_S,
-                )
-                if screenshot_path.stat().st_size > MAX_SCREENSHOT_RAW_BYTES:
-                    clip_height = min(self.height * FULL_PAGE_FALLBACK_VIEWPORTS, page_height)
-                    await self._page.screenshot(
-                        path=str(screenshot_path),
-                        clip={"x": 0, "y": 0, "width": self.width, "height": clip_height},
-                    )
-                    if screenshot_path.stat().st_size > MAX_SCREENSHOT_RAW_BYTES:
-                        # Still too big (rare - very dense visual content).
-                        # Fall back to a plain viewport screenshot, guaranteed small.
-                        await self._page.screenshot(path=str(screenshot_path), full_page=False)
-                        truncation_note = (
-                            "Note: this page was too large to capture in full even "
-                            "when clipped - showing only the current viewport. Use "
-                            "scroll or get_page_text for the rest of the page.\n"
-                        )
-                    else:
-                        truncation_note = (
-                            f"Note: the full page was too large to send in one "
-                            f"screenshot, so this shows only the top {clip_height}px "
-                            f"(the part most likely to matter - headers, summaries, "
-                            f"metadata). Use scroll or get_page_text for content "
-                            f"further down the page.\n"
-                        )
-            else:
-                await self._page.screenshot(path=str(screenshot_path), full_page=False)
-
-            # Read the file and encode to base64
-            screenshot_bytes = screenshot_path.read_bytes()
-            image_base64 = base64.b64encode(screenshot_bytes).decode()
-
-            return ToolResult(output=saved_note + truncation_note, error=None, base64_image=image_base64)
-        except ToolError:
-            raise
-        except asyncio.TimeoutError as e:
-            raise ToolError(
-                f"Full-page screenshot timed out after "
-                f"{FULL_PAGE_SCREENSHOT_TIMEOUT_S}s (page may be lazy-loading "
-                f"content indefinitely). Use scroll or get_page_text instead."
-            ) from e
-        except Exception as e:
-            raise ToolError(f"Failed to take screenshot: {str(e)}") from e
+        await self._wait_for_page_ready()
+        return await capture_screenshot(
+            self._page, self.run_dir, width=self.width, height=self.height, full_page=full_page
+        )
 
     async def _zoom_screenshot(
         self, x: int, y: int, width: int, height: int
