@@ -33,9 +33,34 @@ from browser_use_demo.run_context import get_run_dir, new_run_id
 from browser_use_demo.run_logger import RunLogger
 from browser_use_demo.text_utils import clean_text_extraction_markers
 from browser_use_demo.tools import ToolResult
+from browser_use_demo.tools.sub_browser_queue import SubBrowserQueue
 
 CONFIG_DIR = PosixPath("~/.anthropic").expanduser()
 API_KEY_FILE = CONFIG_DIR / "api_key"
+
+# Process-wide (NOT st.session_state - a plain module global, shared across
+# every session Streamlit's one server process handles), holding whichever
+# session is currently the "main" one. Exists so the standalone
+# ?view=queue page - a separate browser tab/iframe, and therefore a
+# genuinely different session_state instance AND a different Streamlit
+# session thread, with no access to the main session's own state - can
+# still find and render the SAME SubBrowserQueue's live activity.
+# Deliberately single-slot, not keyed by run_id: this app is a single-user,
+# one-session-at-a-time demo (see image/static_content/index.html, which
+# embeds this app's own /?view=queue as its third pane specifically to read
+# this), so there's no real multi-session case to key against, and adding
+# one would need the two iframes to coordinate on a run_id neither knows
+# before the main session has actually started.
+#
+# "previews" holds the last-computed live-preview images (see
+# render_queue_heartbeat), not just the queue object itself, because
+# capturing them requires awaiting Playwright calls on Page objects bound
+# to the MAIN session's own asyncio event loop - asyncio loops aren't
+# thread-safe to drive from a different thread (which the ?view=queue
+# session runs on), so that capture can only safely happen on the main
+# session's own periodic tick. The queue-only view is a pure reader of
+# whatever was last published here - never runs that capture itself.
+_ACTIVE_SESSION = {"queue": None, "previews": {}}
 
 STREAMLIT_STYLE = """
 <style>
@@ -117,6 +142,14 @@ def setup_state():
             mode="none",
             browser_tool=st.session_state.browser_tool,
             run_logger=st.session_state.run_logger,
+        ),
+        # Same reasoning as guardrail_policy - one instance for the session,
+        # its max_fanout flipped in place from the sidebar. Must also stay
+        # after browser_tool in this dict.
+        "sub_browser_queue": lambda: SubBrowserQueue(
+            browser_tool=st.session_state.browser_tool,
+            run_dir=run_dir,
+            max_fanout=8,
         ),
     }
 
@@ -474,6 +507,91 @@ def render_artifacts_panel(run_dir):
         )
 
 
+@st.fragment(run_every="2s")
+def render_queue_heartbeat():
+    """Lives in the MAIN chat session's own page (not the ?view=queue page -
+    see render_sub_browser_panel/render_queue_only_view below) purely to keep
+    driving the shared event loop and publishing fresh live previews into
+    _ACTIVE_SESSION, independent of whether anyone has the dedicated queue
+    view open. Two jobs, both real, neither skippable:
+
+    1. pump_and_preview advances SubBrowserQueue's scheduled item tasks -
+       asyncio.create_task only SCHEDULES an item's work, it doesn't run it,
+       and nothing else keeps this session's loop spinning once the agent
+       turn that queued the items has ended (see SubBrowserQueue.pump_async).
+    2. Captures live previews (Playwright screenshot calls on Page objects
+       bound to THIS session's own event loop) and publishes them to
+       _ACTIVE_SESSION["previews"] - the ?view=queue page runs on a
+       different Streamlit session thread, and asyncio loops aren't
+       thread-safe to drive cross-thread, so it can only ever read what
+       gets published here, never capture previews itself.
+
+    Renders a one-line status + link, not the full grid - the dedicated
+    /?view=queue page (see index.html's third pane) is where that lives.
+    """
+    queue = st.session_state.sub_browser_queue
+    _ACTIVE_SESSION["queue"] = queue
+    loop = get_or_create_event_loop()
+    _ACTIVE_SESSION["previews"] = loop.run_until_complete(queue.pump_and_preview())
+
+    snap = queue.snapshot()
+    status_bits = [f"{snap['pending_count']} pending", f"{snap['in_progress_count']} running"]
+    if snap["paused"]:
+        status_bits.append("⏸ paused")
+    st.caption(f"🧪 Sub-browser queue: {' · '.join(status_bits)} — live view: `/?view=queue`")
+
+
+def render_sub_browser_panel():
+    """The live grid itself - a pure reader of _ACTIVE_SESSION, safe to call
+    from any session (in particular the standalone ?view=queue page, which
+    runs on a different session thread than the one that actually captures
+    these previews - see render_queue_heartbeat)."""
+    queue = _ACTIVE_SESSION["queue"]
+    if queue is None:
+        st.info("Waiting for the main chat session to start...", icon="🧪")
+        return
+
+    previews = _ACTIVE_SESSION["previews"]
+    snap = queue.snapshot()
+    status_bits = [f"{snap['pending_count']} pending", f"{snap['in_progress_count']} running"]
+    if snap["paused"]:
+        status_bits.append("⏸ paused")
+    st.caption(" · ".join(status_bits))
+
+    if not previews:
+        st.info("No sub-browsers running right now - ask the agent to queue some screenshots.", icon="🧪")
+    else:
+        cols = st.columns(2)
+        for i, (item_id, b64_jpeg) in enumerate(previews.items()):
+            with cols[i % len(cols)]:
+                st.image(base64.b64decode(b64_jpeg), caption=item_id, use_container_width=True)
+
+    if snap["completed"]:
+        with st.expander(f"Finished ({len(snap['completed'])})", expanded=False):
+            for item in snap["completed"][:20]:
+                icon = "✅" if item["status"] == "done" else "⚠️"
+                detail = f"{len(item['screenshots'])} screenshot(s)" if item["status"] == "done" else item["error"]
+                st.caption(f"{icon} {item['id']} — {detail}")
+
+
+@st.fragment(run_every="2s")
+def _render_sub_browser_panel_fragment():
+    render_sub_browser_panel()
+
+
+def render_queue_only_view():
+    """The standalone page served at /?view=queue - index.html's third pane
+    points here (see image/static_content/index.html) so the live grid gets
+    its own dedicated column instead of sharing space with the chat. No
+    sidebar, no chat, no setup_state() (this session never needs its own
+    BrowserTool/agent client - it's a read-only view onto the main
+    session's queue, via _ACTIVE_SESSION)."""
+    st.set_page_config(page_title="Sub-browser Queue", page_icon="🧪", layout="wide")
+    st.markdown(STREAMLIT_STYLE, unsafe_allow_html=True)
+    st.title("🧪 Sub-browser Queue")
+    _render_sub_browser_panel_fragment()
+
+
 def authenticate():
     """Handle API key authentication."""
     if not st.session_state.api_key:
@@ -529,6 +647,7 @@ async def get_or_create_agent_client() -> ClaudeSDKClient:
             api_key=st.session_state.api_key,
             max_turns=st.session_state.max_turns,
             guardrail_policy=st.session_state.guardrail_policy,
+            sub_browser_queue=st.session_state.sub_browser_queue,
         )
         client = ClaudeSDKClient(options=options)
         await client.connect()
@@ -657,6 +776,15 @@ async def run_agent(user_input: str):
 
 def main():
     """Main application entry point."""
+    # Standalone read-only queue view - a genuinely separate Streamlit
+    # session (own thread, own session_state), never the main chat session
+    # itself. Dispatched first, before set_page_config/setup_state, since
+    # this path sets its own page config and doesn't need a BrowserTool/
+    # agent client at all. See render_queue_only_view's docstring.
+    if st.query_params.get("view") == "queue":
+        render_queue_only_view()
+        return
+
     st.set_page_config(
         page_title="Claude Browser Use Demo",
         page_icon="🌐",
@@ -739,6 +867,14 @@ def main():
             ),
         )
         st.session_state.guardrail_policy.mode = st.session_state.restriction_mode
+
+        # No sidebar control for the sub-browser queue's fanout/pacing - it
+        # never had anything worth showing here (the live grid lives at
+        # /?view=queue, embedded as index.html's third pane - see
+        # render_queue_only_view/render_sub_browser_panel), and max_fanout/
+        # min_interval_s are now agent-settable directly via queue_screenshots'
+        # own arguments (see tools/sub_browser_queue.py) instead of a human
+        # dialing in a fixed value up front.
 
         # Conversation Management Section
         st.divider()
@@ -845,6 +981,7 @@ def main():
     if not authenticate():
         return
 
+    render_queue_heartbeat()
 
     # Create container for conversation history
     history_container = st.container()
@@ -857,10 +994,6 @@ def main():
     # Create container for active/streaming responses
     active_container = st.container()
     st.session_state.active_response_container = active_container
-
-    # Simple callback to disable chat input on submit
-    def disable_chat_callback():
-        st.session_state.chat_disabled = True
 
     # Show persistent error message if there is one
     if st.session_state.last_error:
@@ -903,6 +1036,10 @@ def main():
     # Show status when chat is disabled
     if st.session_state.chat_disabled:
         st.info("🤖 Claude is currently processing your request. Please wait...")
+
+    # Simple callback to disable chat input on submit
+    def disable_chat_callback():
+        st.session_state.chat_disabled = True
 
     # Simple chat input with disabled state
     prompt = st.chat_input(
