@@ -45,6 +45,11 @@ class TestBuildOptions:
             "mcp__browser_use__batch_extract",
             "mcp__browser_use__run_script",
             "mcp__browser_use__verify_finding",
+            "mcp__browser_use__queue_screenshots",
+            "mcp__browser_use__queue_status",
+            "mcp__browser_use__queue_clear",
+            "mcp__browser_use__queue_pause",
+            "mcp__browser_use__queue_resume",
         ]
 
     def test_disables_built_in_claude_code_toolset(self, tmp_path):

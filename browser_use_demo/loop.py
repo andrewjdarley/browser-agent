@@ -20,6 +20,14 @@ from .run_logger import RunLogger
 from .tools import BrowserTool, FileOutputTool
 from .tools.batch_extract import BatchExtractTool, build_batch_extract_tool_fn
 from .tools.script_runner import ScriptRunnerTool, build_run_script_tool_fn
+from .tools.sub_browser_queue import (
+    SubBrowserQueue,
+    build_queue_clear_tool_fn,
+    build_queue_pause_tool_fn,
+    build_queue_resume_tool_fn,
+    build_queue_screenshots_tool_fn,
+    build_queue_status_tool_fn,
+)
 from .tools.subagent import DispatchSubagentsTool, build_dispatch_subagents_tool_fn
 from .tools.verify import MAX_VERIFICATIONS_PER_SESSION, VerifyFindingTool, build_verify_finding_tool_fn
 
@@ -51,6 +59,8 @@ Don't scroll blindly in small increments to explore a page. If you don't already
 If a task involves several similar items and manually repeating the same steps on each would clearly take many tool calls, script it instead - this is a normal, common solution, not a last resort. Whether that's worth it depends on per-item effort as much as item count: even 5-10 items can be worth scripting if each requires several steps by hand. First inspect one example page/item manually to work out the recipe. Iterating on it - try it, look at what came back, fix it, try again - against that one example before applying it to the rest is expected; don't expect to get it right in one attempt.
 
 Default to run_script for this: it replays a fixed sequence of steps (same action names as this tool - navigate, screenshot, get_page_text, execute_js, wait) once per item, over a pool of pages from your current session (inherits cookies/login), with no LLM cost per item. Whether it fetches or renders falls out of what you put in the script, not a separate choice: a script with no navigate step fetches each item as a URL via raw HTTP (fast, but only sees server-rendered HTML, not content that appears after client-side JS runs - same mechanism and same limitation as batch_extract, since that's literally what this is under the hood); a script that starts with navigate gets a real rendered page per item, so screenshot/get_page_text/JS that depends on client-rendering all work. batch_extract still exists as a narrower standalone tool for the fetch-only case if you prefer it, but run_script covers everything it does plus the render+screenshot case in one place. If the data you need isn't in a page's raw source and you don't want to pay render cost per item, try network_list/network_inspect first to find the JSON endpoint actually behind it (often hittable directly, still cheap) - the browser tool's execute_js fetch() + Promise.all is also an option for same-origin bulk calls against the CURRENT page specifically (not run_script's per-item pages), but depends on that page's own context in ways that can silently break (fetch() has been observed failing outright - a hard "Failed to fetch" on every request - when run from a page a browser renders specially, like a raw JSON API response). None of these tools support real per-item interaction or judgment (forms, multi-step flows, deciding what to click) - that's still dispatch_subagents.
+
+When a task is purely visual reconnaissance across many pages/sites - "screenshot the pricing section of each of these sites," "capture what the homepage looks like for each of these" - and doesn't need any data extracted or reasoning per item, use queue_screenshots instead of run_script or navigating one at a time yourself. Drop in a list of items (each a short sequence of navigate/scroll_to/screenshot steps) and it returns immediately with queued item ids - it does not wait for them. They run concurrently in the background (up to the sidebar's fanout limit) while you keep working on other things, and their screenshots appear live in the sidebar as they finish. Call queue_status when you want to check progress or read results yourself (e.g. before referencing a screenshot in your final message). queue_pause/queue_resume/queue_clear manage the queue itself. This is screenshots only, not data extraction (use run_script/batch_extract for that) and not interaction (use dispatch_subagents for that).
 
 When you need to hand the user a deliverable file (a CSV, a report, extracted data), use the save_file tool. Don't try to trigger a browser download via execute_js - that saves inside the automated browser's own environment, not somewhere the user can find it.
 
@@ -98,6 +108,7 @@ def build_options(
     max_turns: int = 200,
     max_budget_usd: Optional[float] = None,
     guardrail_policy: Optional[GuardrailPolicy] = None,
+    sub_browser_queue: Optional[SubBrowserQueue] = None,
 ) -> ClaudeAgentOptions:
     """Build the SDK options for a browser-automation session.
 
@@ -107,12 +118,21 @@ def build_options(
     flips `.mode` in place from the sidebar toggle, with no client reconnect
     needed for that to take effect). Defaults to a fresh "none" policy -
     i.e. no behavior change for any caller that doesn't pass one.
+
+    sub_browser_queue: same reasoning as guardrail_policy - pass the
+    caller's own SubBrowserQueue (see tools/sub_browser_queue.py) so pending/
+    completed items and the fanout setting survive a reconnect and stay
+    readable by the caller's own UI (Streamlit's sidebar panel reads the
+    same instance's .snapshot()). Defaults to a fresh, empty queue.
     """
     system_prompt = BROWSER_SYSTEM_PROMPT
     if system_prompt_suffix:
         system_prompt = f"{system_prompt} {system_prompt_suffix}"
     guardrail_policy = guardrail_policy or GuardrailPolicy(
         mode="none", browser_tool=browser_tool, run_logger=run_logger
+    )
+    sub_browser_queue = sub_browser_queue or SubBrowserQueue(
+        browser_tool=browser_tool, run_dir=browser_tool.run_dir
     )
 
     dispatch_subagents_tool = DispatchSubagentsTool(
@@ -145,6 +165,11 @@ def build_options(
             build_batch_extract_tool_fn(batch_extract_tool),
             build_run_script_tool_fn(script_runner_tool),
             build_verify_finding_tool_fn(verify_finding_tool),
+            build_queue_screenshots_tool_fn(sub_browser_queue),
+            build_queue_status_tool_fn(sub_browser_queue),
+            build_queue_clear_tool_fn(sub_browser_queue),
+            build_queue_pause_tool_fn(sub_browser_queue),
+            build_queue_resume_tool_fn(sub_browser_queue),
         ],
     )
 
@@ -171,6 +196,11 @@ def build_options(
             "mcp__browser_use__batch_extract",
             "mcp__browser_use__run_script",
             "mcp__browser_use__verify_finding",
+            "mcp__browser_use__queue_screenshots",
+            "mcp__browser_use__queue_status",
+            "mcp__browser_use__queue_clear",
+            "mcp__browser_use__queue_pause",
+            "mcp__browser_use__queue_resume",
         ],
         max_turns=max_turns,
         max_budget_usd=max_budget_usd,

@@ -33,6 +33,7 @@ from browser_use_demo.run_context import get_run_dir, new_run_id
 from browser_use_demo.run_logger import RunLogger
 from browser_use_demo.text_utils import clean_text_extraction_markers
 from browser_use_demo.tools import ToolResult
+from browser_use_demo.tools.sub_browser_queue import SubBrowserQueue
 
 CONFIG_DIR = PosixPath("~/.anthropic").expanduser()
 API_KEY_FILE = CONFIG_DIR / "api_key"
@@ -89,6 +90,7 @@ def setup_state():
         "rendered_message_count": 0,  # Track rendered messages to avoid re-rendering
         "last_error": None,  # Store last error message to display persistently
         "restriction_mode": "none",  # Guardrail toggle - see the sidebar widget below
+        "max_subbrowser_fanout": 8,  # Sub-browser queue toggle - see the sidebar widget below
         # API Configuration
         "api_key": os.environ.get("ANTHROPIC_API_KEY", ""),
         "max_turns": 200,
@@ -117,6 +119,14 @@ def setup_state():
             mode="none",
             browser_tool=st.session_state.browser_tool,
             run_logger=st.session_state.run_logger,
+        ),
+        # Same reasoning as guardrail_policy - one instance for the session,
+        # its max_fanout flipped in place from the sidebar. Must also stay
+        # after browser_tool in this dict.
+        "sub_browser_queue": lambda: SubBrowserQueue(
+            browser_tool=st.session_state.browser_tool,
+            run_dir=run_dir,
+            max_fanout=8,
         ),
     }
 
@@ -474,6 +484,53 @@ def render_artifacts_panel(run_dir):
         )
 
 
+@st.fragment(run_every="2s")
+def render_sub_browser_panel(run_dir):
+    """Right-column panel for the sub-browser screenshot queue (see
+    tools/sub_browser_queue.py) - the queue_screenshots/queue_status/etc.
+    tools' shared state, read here for display only (never mutated by this
+    function beyond the pump() call below).
+
+    st.fragment(run_every="2s") makes this refresh on its own, independent
+    of chat activity, WITHOUT rerunning the rest of the page - the piece
+    that makes results feel "live" rather than only updating on the next
+    message. Every tick, this actually drives the session's shared event
+    loop forward via pump_async (NOT just a bare sync call) - a plain
+    asyncio.create_task only schedules an item's work, it doesn't run it,
+    and nothing else keeps this loop spinning once the agent turn that
+    queued the items has ended - see SubBrowserQueue.pump_async's
+    docstring. Must be the SAME loop the coordinator's own BrowserTool
+    (and its Playwright connection) already runs on - get_or_create_event_loop,
+    not a fresh one - or Playwright raises a cross-loop error.
+    """
+    queue = st.session_state.sub_browser_queue
+    loop = get_or_create_event_loop()
+    loop.run_until_complete(queue.pump_async())
+    snap = queue.snapshot()
+
+    st.subheader("🧪 Sub-browser Queue")
+    status_bits = [f"{snap['pending_count']} pending", f"{snap['in_progress_count']} running"]
+    if snap["paused"]:
+        status_bits.append("⏸ paused")
+    st.caption(" · ".join(status_bits))
+
+    if not snap["completed"]:
+        st.info("No results yet - ask the agent to queue some screenshots.", icon="🧪")
+        return
+
+    for item in snap["completed"]:
+        icon = "✅" if item["status"] == "done" else "⚠️"
+        with st.expander(f"{icon} {item['id']}", expanded=False):
+            for filename in item["screenshots"]:
+                path = run_dir / filename
+                if path.exists():
+                    st.image(str(path), caption=filename)
+            if item.get("error"):
+                st.error(item["error"])
+            if item["log"]:
+                st.code("\n".join(item["log"]))
+
+
 def authenticate():
     """Handle API key authentication."""
     if not st.session_state.api_key:
@@ -529,6 +586,7 @@ async def get_or_create_agent_client() -> ClaudeSDKClient:
             api_key=st.session_state.api_key,
             max_turns=st.session_state.max_turns,
             guardrail_policy=st.session_state.guardrail_policy,
+            sub_browser_queue=st.session_state.sub_browser_queue,
         )
         client = ClaudeSDKClient(options=options)
         await client.connect()
@@ -740,6 +798,27 @@ def main():
         )
         st.session_state.guardrail_policy.mode = st.session_state.restriction_mode
 
+        # Sub-browser screenshot queue - fanout control. Mutated in place on
+        # the shared SubBrowserQueue instance, same reasoning as the
+        # guardrail toggle above (no client reconnect needed for it to
+        # apply). Results panel is in the main area, right column - see
+        # render_sub_browser_panel.
+        st.divider()
+        st.subheader("🧪 Sub-browser Queue")
+        st.number_input(
+            "Max Sub-browser Fanout",
+            min_value=1,
+            max_value=32,
+            value=st.session_state.max_subbrowser_fanout,
+            step=1,
+            key="max_subbrowser_fanout",
+            help=(
+                "How many queue_screenshots items run concurrently at once. Results "
+                "appear in the panel to the right of the chat as they finish."
+            ),
+        )
+        st.session_state.sub_browser_queue.max_fanout = st.session_state.max_subbrowser_fanout
+
         # Conversation Management Section
         st.divider()
         st.subheader("💬 Conversation")
@@ -845,64 +924,74 @@ def main():
     if not authenticate():
         return
 
+    # Chat area (left) and the live sub-browser queue panel (right) - kept
+    # as two real columns, not tabs, so the queue panel stays visible (and
+    # keeps auto-refreshing via its own st.fragment) while chatting. Deliberately
+    # NOT wrapping st.chat_input below - it stays full-width at the very
+    # bottom of the page, unchanged from before this feature.
+    main_col, side_col = st.columns([3, 1])
 
-    # Create container for conversation history
-    history_container = st.container()
+    with side_col:
+        render_sub_browser_panel(st.session_state.run_dir)
 
-    # Display conversation history in the history container
-    renderer = MessageRenderer(st.session_state)
-    with history_container:
-        renderer.render_conversation_history(st.session_state.messages)
+    with main_col:
+        # Create container for conversation history
+        history_container = st.container()
 
-    # Create container for active/streaming responses
-    active_container = st.container()
-    st.session_state.active_response_container = active_container
+        # Display conversation history in the history container
+        renderer = MessageRenderer(st.session_state)
+        with history_container:
+            renderer.render_conversation_history(st.session_state.messages)
+
+        # Create container for active/streaming responses
+        active_container = st.container()
+        st.session_state.active_response_container = active_container
+
+        # Show persistent error message if there is one
+        if st.session_state.last_error:
+            st.error(st.session_state.last_error["message"])
+            if st.session_state.last_error["traceback"]:
+                with st.expander("Show full traceback"):
+                    st.code(st.session_state.last_error["traceback"])
+            if st.button("Clear Error"):
+                st.session_state.last_error = None
+                st.rerun()
+
+        # Guardrail approvals pending (Manual restriction mode only - see the
+        # sidebar toggle). Rendered here, in the main chat area, rather than the
+        # sidebar - it's about a specific blocked action from the conversation,
+        # not session configuration. Approving adds the call's fingerprint to
+        # guardrail_policy.approved (single-use) - the agent still has to retry
+        # the exact same action for it to actually go through, since the turn
+        # that got denied has already ended by the time a human can click here.
+        pending = st.session_state.guardrail_policy.pending
+        if pending:
+            st.warning(f"🛡️ {len(pending)} action(s) blocked by guardrails, awaiting approval")
+            for entry in list(pending):
+                action = entry["tool_input"].get("action", entry["tool_name"])
+                with st.expander(f"{action} — {entry['rule']}", expanded=True):
+                    st.code(json.dumps(entry["tool_input"], indent=2), language="json")
+                    st.caption(entry["reason"])
+                    approve_col, dismiss_col = st.columns(2)
+                    if approve_col.button(
+                        "✅ Approve", key=f"guardrail_approve_{entry['fingerprint']}", use_container_width=True
+                    ):
+                        st.session_state.guardrail_policy.approved.add(entry["fingerprint"])
+                        pending.remove(entry)
+                        st.rerun()
+                    if dismiss_col.button(
+                        "✖️ Dismiss", key=f"guardrail_dismiss_{entry['fingerprint']}", use_container_width=True
+                    ):
+                        pending.remove(entry)
+                        st.rerun()
+
+        # Show status when chat is disabled
+        if st.session_state.chat_disabled:
+            st.info("🤖 Claude is currently processing your request. Please wait...")
 
     # Simple callback to disable chat input on submit
     def disable_chat_callback():
         st.session_state.chat_disabled = True
-
-    # Show persistent error message if there is one
-    if st.session_state.last_error:
-        st.error(st.session_state.last_error["message"])
-        if st.session_state.last_error["traceback"]:
-            with st.expander("Show full traceback"):
-                st.code(st.session_state.last_error["traceback"])
-        if st.button("Clear Error"):
-            st.session_state.last_error = None
-            st.rerun()
-
-    # Guardrail approvals pending (Manual restriction mode only - see the
-    # sidebar toggle). Rendered here, in the main chat area, rather than the
-    # sidebar - it's about a specific blocked action from the conversation,
-    # not session configuration. Approving adds the call's fingerprint to
-    # guardrail_policy.approved (single-use) - the agent still has to retry
-    # the exact same action for it to actually go through, since the turn
-    # that got denied has already ended by the time a human can click here.
-    pending = st.session_state.guardrail_policy.pending
-    if pending:
-        st.warning(f"🛡️ {len(pending)} action(s) blocked by guardrails, awaiting approval")
-        for entry in list(pending):
-            action = entry["tool_input"].get("action", entry["tool_name"])
-            with st.expander(f"{action} — {entry['rule']}", expanded=True):
-                st.code(json.dumps(entry["tool_input"], indent=2), language="json")
-                st.caption(entry["reason"])
-                approve_col, dismiss_col = st.columns(2)
-                if approve_col.button(
-                    "✅ Approve", key=f"guardrail_approve_{entry['fingerprint']}", use_container_width=True
-                ):
-                    st.session_state.guardrail_policy.approved.add(entry["fingerprint"])
-                    pending.remove(entry)
-                    st.rerun()
-                if dismiss_col.button(
-                    "✖️ Dismiss", key=f"guardrail_dismiss_{entry['fingerprint']}", use_container_width=True
-                ):
-                    pending.remove(entry)
-                    st.rerun()
-
-    # Show status when chat is disabled
-    if st.session_state.chat_disabled:
-        st.info("🤖 Claude is currently processing your request. Please wait...")
 
     # Simple chat input with disabled state
     prompt = st.chat_input(
