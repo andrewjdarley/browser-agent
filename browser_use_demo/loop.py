@@ -1,0 +1,149 @@
+"""
+Agent orchestration for browser automation, built on the Claude Agent SDK.
+
+The SDK handles the tool-calling loop, session/context management, and (once
+wired up) subagents/hooks/permissions. We only own: the browser tool itself
+(tools/browser.py), the system prompt, and translating the SDK's message
+stream into the shapes browser_use_demo's Streamlit renderer already expects.
+"""
+
+from datetime import datetime
+from typing import Optional
+
+from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, HookMatcher
+
+from .agent_sdk_bridge import MAX_BUFFER_SIZE, build_mcp_server
+from .model_config import SUBAGENT_MODEL, VERIFY_MODEL
+from .model_config import resolve as resolve_model
+from .run_logger import RunLogger
+from .tools import BrowserTool, FileOutputTool
+from .tools.batch_extract import BatchExtractTool, build_batch_extract_tool_fn
+from .tools.subagent import DispatchSubagentsTool, build_dispatch_subagents_tool_fn
+from .tools.verify import MAX_VERIFICATIONS_PER_SESSION, VerifyFindingTool, build_verify_finding_tool_fn
+
+# Browser-specific system prompt. Passed as a plain string (not the
+# `claude_code` preset) so the coordinator doesn't inherit Claude Code's
+# coding-assistant framing, default tools, or system prompt.
+BROWSER_SYSTEM_PROMPT = f"""<SYSTEM_CAPABILITY>
+* You control a Chromium browser via Playwright automation.
+* The current date is {datetime.today().strftime("%A, %B %-d, %Y")}.
+</SYSTEM_CAPABILITY>
+
+<TOOL_GUIDANCE>
+You receive a screenshot at the start of each turn purely for orientation - to see whether you're already on the right page before deciding whether to navigate again. Do not use it to read text, locate elements, or decide where to click.
+
+Navigation and interaction rely on the DOM, essentially always - not as a preference, as the default you don't deviate from without a specific reason. You get the DOM's current state automatically, without having to ask for it every time: a full tree the first time you land on a page (navigate), or whenever you explicitly call read_page, and a diff against what you last saw after every other action that can change the page (clicks, typing, scrolling, form_input, execute_js, etc.) - appended right to that action's own result. Use the element refs (ref_1, ref_2, ...) it gives you with your interaction tools (click, type, hover, form_input, scroll_to). Never click by raw (x, y) coordinate unless a specific element genuinely has no ref - and check with read_page before concluding that, don't assume it. Coordinate-clicking on a page you haven't actually inspected is exactly how tasks go wrong: clicking a red-herring link, landing on unrelated content, or building an answer from what a screenshot looked like instead of what the page actually contains.
+
+Screenshots are for exactly two things: an explicitly requested visual deliverable, and a genuine last resort when the DOM isn't giving you useful signal (e.g. canvas-rendered content, or an accessibility tree that comes back empty/broken). They are not a parallel way to look around or extract information - never read text, counts, dates, or any other data off a screenshot when get_page_text, the DOM tree/diff, or execute_js could get it from the real page content instead. If you ever find yourself about to transcribe something from a screenshot into a final answer or file, stop and get it from the DOM first.
+
+Two different ways to locate something on a page, for two different needs. When you're looking for something by description ("the search box", "the citation that mentions Beevor") rather than an exact position, use find - it does semantic matching over the whole page for you. When you need an exact position or count ("item number N in a list"), that's a precise-counting problem, not a description-matching one - find isn't reliable for this (it's an LLM eyeballing a large dump of the page, which is exactly the kind of counting task LLMs get wrong), so write execute_js instead, and don't assume your selector's scope without checking it. If your execute_js code has more than one statement, or uses `return`, wrap it in an immediately-invoked function - `(() => {{ ...; return x; }})()` - not bare statements at the top level. A top-level `return` outside a function is a JavaScript syntax error and the call will fail immediately; this has been a repeated, avoidable failure. A single expression (e.g. `document.title`) doesn't need wrapping. A class-based selector (e.g. ".references li") matches descendants of EVERY element with that class combined into one list, even if there are multiple separate ones on the page (e.g. a short "Notes" list and a long "References" list can share the same class) - so indexing into it can silently land in the wrong place. Before trusting a positional index: confirm how many distinct containers your selector's root actually matches and that you've picked the right one specifically (e.g. query the containers themselves first - document.querySelectorAll('ol.references') - and pick the one whose size matches what you expect), then cross-check the specific element you land on against something you can directly observe (its actually-rendered/visible text, or an outline screenshot - see below) before treating it as the answer - don't stop at the first result that runs without erroring.
+
+When you have a batch of items that genuinely need per-item reasoning or interaction (forms, multi-step flows, judgment calls) - not just data extraction - use dispatch_subagents instead of processing them one at a time in a loop: it runs them concurrently, each with its own browser tab, all following the same shared instructions you give it. For pure data extraction at scale, see the scripting guidance below instead - it's far cheaper per item.
+
+Don't scroll blindly in small increments to explore a page. If you don't already know exactly where your target is, call read_page (or re-check it) to find an element ref, or scroll_to a major structural landmark (a section heading, a "load more" control, etc.) and look at what's there - then decide your next move from what you actually see. Only use plain directional scroll when you're confident you're already close to the target and it'll take at most one or two calls to get there. If you're scrolling repeatedly without a specific ref in mind, stop and look at the DOM instead.
+
+If a task involves several similar items and manually repeating the same steps on each would clearly take many tool calls, script it instead - this is a normal, common solution, not a last resort. Whether that's worth it depends on per-item effort as much as item count: even 5-10 items can be worth scripting if each requires several steps by hand. First inspect one example page to work out the extraction logic. Iterating on the extraction JS - try it, look at what came back, fix it, try again - against that one page before applying it to the rest is expected; don't expect to get it right in one attempt. Default to batch_extract for concurrent multi-URL fetching, same-origin or not - it fetches many URLs concurrently (reusing your logged-in session, with built-in backoff if a site starts rate-limiting you) and runs your extraction JS against each one, isolated from whatever page you currently happen to be on. Writing your own execute_js fetch() + Promise.all loop instead is not just narrower (same-origin only) - it also depends on the current page's own context, which can silently and unpredictably break it: fetch() calls have been observed failing outright (not from rate-limiting - a hard "Failed to fetch" on every request) when run from a page a browser renders specially, like a raw JSON API response. Reach for a manual fetch loop only when you specifically need it to run against the live current page's own state (e.g. an authenticated fetch that must reuse in-page JS variables). batch_extract only sees server-rendered HTML, not content that appears after client-side JS runs - if the data you need isn't in the raw page source, fall back to dispatch_subagents or manual navigation instead.
+
+When you need to hand the user a deliverable file (a CSV, a report, extracted data), use the save_file tool. Don't try to trigger a browser download via execute_js - that saves inside the automated browser's own environment, not somewhere the user can find it.
+
+The user only reads your final message - they do not scroll back up through the tool calls in between. Whatever deliverable your task actually produced (a screenshot, a saved file, anything else with a filename on disk), name its exact filename in your final message instead of referring to it vaguely (e.g. "the screenshot above" or "the file in the sidebar") - the app detects filenames you mention and surfaces them automatically, but only if you name them in your last message.
+
+Before treating a specific element as evidence for a finding (e.g. "this is the citation/link/row that answers the question"), you can use outline(ref) to draw a bounding box around it and screenshot it - a fast visual gut-check that you landed on the right element and not a neighbor with similar text or structure. This is a visual aid, not a substitute for verify_finding below. Note: this tool draws a box - it does not search for or interact with anything a page itself calls "highlighted" (e.g. a Wikipedia page's own highlighted-section behavior after following a citation). If a task's own wording uses "highlight", treat that as the page's behavior to locate via the DOM, not a cue to reach for this tool.
+
+Before presenting a finding as fact, check whether it's ALL THREE of: specific (a discrete, falsifiable value - a number, name, date, identifier - not a vague summary), checkable (there's a concrete way to confirm it independently of how you found it), and consequential (getting it wrong would make your final answer or deliverable wrong). Only when all three hold, call verify_finding to get an independent, fresh re-derivation before relying on it - a self-review in the same context tends to just confirm your own assumptions, since it's reasoning from the same trail that produced the answer; a fresh session with no visibility into your reasoning can actually catch it being wrong. This budget is small (only {MAX_VERIFICATIONS_PER_SESSION} uses per session) - spend it on the claim(s) that matter most to the final answer, not routine intermediate steps. If verification contradicts your finding, trust the independent result and redo the affected work. If you're out of budget for a claim that still needs checking, say so explicitly in your final answer rather than presenting it as verified.
+</TOOL_GUIDANCE>
+
+<TIPS>
+* Prefer get_page_text over scrolling when looking for information - it's faster and more reliable
+* Use screenshot with full_page: true to capture an entire page in one image instead of scrolling repeatedly
+* Use execute_js to extract data from JavaScript variables, localStorage, or trigger behaviors not accessible through clicks
+* Use full URLs with https://
+* Use wait for slow-loading pages
+* Use form_input with refs for form fields
+* Use key for shortcuts (e.g., "ctrl+a")
+* Close popups when they appear
+* Verify actions succeeded before moving on
+</TIPS>"""
+
+
+def build_options(
+    *,
+    model: str,
+    system_prompt_suffix: str,
+    browser_tool: BrowserTool,
+    file_output_tool: FileOutputTool,
+    run_logger: RunLogger,
+    api_key: str,
+    max_turns: int = 50,
+    max_budget_usd: Optional[float] = None,
+) -> ClaudeAgentOptions:
+    """Build the SDK options for a browser-automation session."""
+    system_prompt = BROWSER_SYSTEM_PROMPT
+    if system_prompt_suffix:
+        system_prompt = f"{system_prompt} {system_prompt_suffix}"
+
+    dispatch_subagents_tool = DispatchSubagentsTool(
+        run_dir=browser_tool.run_dir,
+        run_logger=run_logger,
+        api_key=api_key,
+        model=resolve_model(SUBAGENT_MODEL, model),
+        base_system_prompt=BROWSER_SYSTEM_PROMPT,
+    )
+    batch_extract_tool = BatchExtractTool(
+        browser_tool=browser_tool,
+        file_output_tool=file_output_tool,
+    )
+    verify_finding_tool = VerifyFindingTool(
+        run_dir=browser_tool.run_dir,
+        run_logger=run_logger,
+        api_key=api_key,
+        model=resolve_model(VERIFY_MODEL, model),
+        base_system_prompt=BROWSER_SYSTEM_PROMPT,
+    )
+    server = build_mcp_server(
+        browser_tool,
+        file_output_tool,
+        extra_tools=[
+            build_dispatch_subagents_tool_fn(dispatch_subagents_tool),
+            build_batch_extract_tool_fn(batch_extract_tool),
+            build_verify_finding_tool_fn(verify_finding_tool),
+        ],
+    )
+
+    return ClaudeAgentOptions(
+        model=model,
+        system_prompt=system_prompt,
+        mcp_servers={"browser_use": server},
+        # `tools=[]` disables the SDK's full built-in Claude Code toolset
+        # (Bash, Read, Write, Edit, Glob, Grep, WebSearch, WebFetch, ...) -
+        # `allowed_tools` alone does NOT do this, it only controls which
+        # tools skip the permission prompt, not which tools exist (see the
+        # SDK's own ClaudeAgentOptions.tools docstring). Without this, a real
+        # run showed the model reaching for Bash/Read directly (curl-ing a
+        # URL, cat-ing a saved tool-result file) when a browser action hit
+        # friction - a much bigger capability surface than "browser
+        # automation" was ever meant to have, and one that bypasses every
+        # safeguard built around the MCP browser tools (rate limiting,
+        # verify_finding, DOM-diff, run_logger's hooks).
+        tools=[],
+        allowed_tools=[
+            "mcp__browser_use__browser",
+            "mcp__browser_use__save_file",
+            "mcp__browser_use__dispatch_subagents",
+            "mcp__browser_use__batch_extract",
+            "mcp__browser_use__verify_finding",
+        ],
+        max_turns=max_turns,
+        max_budget_usd=max_budget_usd,
+        max_buffer_size=MAX_BUFFER_SIZE,
+        env={"ANTHROPIC_API_KEY": api_key},
+        hooks={
+            "UserPromptSubmit": [HookMatcher(hooks=[run_logger.on_user_prompt_submit])],
+            "PreToolUse": [HookMatcher(hooks=[run_logger.on_pre_tool_use])],
+            "PostToolUse": [HookMatcher(hooks=[run_logger.on_post_tool_use])],
+            "PostToolUseFailure": [HookMatcher(hooks=[run_logger.on_post_tool_use_failure])],
+            "Stop": [HookMatcher(hooks=[run_logger.on_stop])],
+            "SubagentStart": [HookMatcher(hooks=[run_logger.on_subagent_start])],
+            "SubagentStop": [HookMatcher(hooks=[run_logger.on_subagent_stop])],
+        },
+    )
