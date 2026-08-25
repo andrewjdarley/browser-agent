@@ -81,7 +81,7 @@ def build_options(
     file_output_tool: FileOutputTool,
     run_logger: RunLogger,
     api_key: str,
-    max_turns: int = 50,
+    max_turns: int = 200,
     max_budget_usd: Optional[float] = None,
 ) -> ClaudeAgentOptions:
     """Build the SDK options for a browser-automation session."""

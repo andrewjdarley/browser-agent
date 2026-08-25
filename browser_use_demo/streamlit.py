@@ -89,7 +89,7 @@ def setup_state():
         "last_error": None,  # Store last error message to display persistently
         # API Configuration
         "api_key": os.environ.get("ANTHROPIC_API_KEY", ""),
-        "max_turns": 50,
+        "max_turns": 200,
         "model": BROWSER_COMPATIBLE_MODELS[DEFAULT_MODEL_INDEX],
         # Runtime State
         "tools": {},
