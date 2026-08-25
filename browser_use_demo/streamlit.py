@@ -25,6 +25,7 @@ from claude_agent_sdk import (
 )
 
 from browser_use_demo.agent_sdk_bridge import sdk_content_to_tool_result, strip_mcp_prefix
+from browser_use_demo.guardrails import GuardrailPolicy
 from browser_use_demo.loop import build_options
 from browser_use_demo.message_renderer import MessageRenderer, Sender
 from browser_use_demo.model_config import MAIN_MODEL
@@ -87,6 +88,7 @@ def setup_state():
         "hide_screenshots": False,
         "rendered_message_count": 0,  # Track rendered messages to avoid re-rendering
         "last_error": None,  # Store last error message to display persistently
+        "restriction_mode": "none",  # Guardrail toggle - see the sidebar widget below
         # API Configuration
         "api_key": os.environ.get("ANTHROPIC_API_KEY", ""),
         "max_turns": 200,
@@ -106,6 +108,16 @@ def setup_state():
         "browser_tool": lambda: BrowserTool(run_dir=run_dir),
         "file_output_tool": lambda: FileOutputTool(run_dir=run_dir),
         "run_logger": lambda: RunLogger(run_dir),
+        # One instance for the whole session (not rebuilt on reconnect, unlike
+        # build_options' other args) so the sidebar toggle can flip `.mode` in
+        # place and pending approvals survive a model/max_turns-triggered
+        # reconnect. Depends on browser_tool/run_logger already being set -
+        # must stay after them (dict iteration order, see the loop below).
+        "guardrail_policy": lambda: GuardrailPolicy(
+            mode="none",
+            browser_tool=st.session_state.browser_tool,
+            run_logger=st.session_state.run_logger,
+        ),
     }
 
     # Apply all defaults - evaluate lambdas when needed
@@ -516,6 +528,7 @@ async def get_or_create_agent_client() -> ClaudeSDKClient:
             run_logger=st.session_state.run_logger,
             api_key=st.session_state.api_key,
             max_turns=st.session_state.max_turns,
+            guardrail_policy=st.session_state.guardrail_policy,
         )
         client = ClaudeSDKClient(options=options)
         await client.connect()
@@ -700,6 +713,33 @@ def main():
             help="Hide screenshot outputs in the chat",
         )
 
+        # Guardrails - restriction mode toggle. Mutating guardrail_policy.mode
+        # in place takes effect on the agent's very next tool call; unlike
+        # model/max_turns this doesn't need a client reconnect (see
+        # GuardrailPolicy's docstring and _agent_config_key, which
+        # deliberately doesn't include this).
+        st.divider()
+        st.subheader("🛡️ Guardrails")
+        st.radio(
+            "Action restriction",
+            options=["none", "all", "manual"],
+            format_func=lambda m: {
+                "none": "None (default - unrestricted)",
+                "all": "All (auto-block irreversible-looking actions)",
+                "manual": "Manual (block, but you can approve)",
+            }[m],
+            key="restriction_mode",
+            help=(
+                "Deterministic pattern checks only (form submits, non-GET JS "
+                "requests, destructive-looking click targets) - not a full "
+                "policy engine and not an LLM judgment call. None: current "
+                "behavior. All: matched actions are denied outright. Manual: "
+                "matched actions are denied, but appear below the chat input "
+                "for you to approve and let the agent retry."
+            ),
+        )
+        st.session_state.guardrail_policy.mode = st.session_state.restriction_mode
+
         # Conversation Management Section
         st.divider()
         st.subheader("💬 Conversation")
@@ -831,6 +871,34 @@ def main():
         if st.button("Clear Error"):
             st.session_state.last_error = None
             st.rerun()
+
+    # Guardrail approvals pending (Manual restriction mode only - see the
+    # sidebar toggle). Rendered here, in the main chat area, rather than the
+    # sidebar - it's about a specific blocked action from the conversation,
+    # not session configuration. Approving adds the call's fingerprint to
+    # guardrail_policy.approved (single-use) - the agent still has to retry
+    # the exact same action for it to actually go through, since the turn
+    # that got denied has already ended by the time a human can click here.
+    pending = st.session_state.guardrail_policy.pending
+    if pending:
+        st.warning(f"🛡️ {len(pending)} action(s) blocked by guardrails, awaiting approval")
+        for entry in list(pending):
+            action = entry["tool_input"].get("action", entry["tool_name"])
+            with st.expander(f"{action} — {entry['rule']}", expanded=True):
+                st.code(json.dumps(entry["tool_input"], indent=2), language="json")
+                st.caption(entry["reason"])
+                approve_col, dismiss_col = st.columns(2)
+                if approve_col.button(
+                    "✅ Approve", key=f"guardrail_approve_{entry['fingerprint']}", use_container_width=True
+                ):
+                    st.session_state.guardrail_policy.approved.add(entry["fingerprint"])
+                    pending.remove(entry)
+                    st.rerun()
+                if dismiss_col.button(
+                    "✖️ Dismiss", key=f"guardrail_dismiss_{entry['fingerprint']}", use_container_width=True
+                ):
+                    pending.remove(entry)
+                    st.rerun()
 
     # Show status when chat is disabled
     if st.session_state.chat_disabled:

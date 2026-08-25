@@ -3,7 +3,10 @@ construction."""
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from browser_use_demo.agent_sdk_bridge import MAX_BUFFER_SIZE
+from browser_use_demo.guardrails import GuardrailPolicy
 from browser_use_demo.loop import BROWSER_SYSTEM_PROMPT, build_options
 from browser_use_demo.run_logger import RunLogger
 from browser_use_demo.tools import BrowserTool, FileOutputTool
@@ -109,6 +112,39 @@ class TestBuildOptions:
             "SubagentStart",
             "SubagentStop",
         }
+
+    @pytest.mark.asyncio
+    async def test_default_guardrail_policy_is_none_mode(self, tmp_path):
+        # No guardrail_policy passed in -> build_options' own default ("none")
+        # applies, so a call that would otherwise match a rule still goes
+        # through - no behavior change for a caller that doesn't opt in.
+        options = make_options(tmp_path)
+        pre_tool_use_hook = options.hooks["PreToolUse"][0].hooks[0]
+        result = await pre_tool_use_hook(
+            {
+                "tool_name": "mcp__browser_use__browser",
+                "tool_input": {"action": "navigate", "text": "https://example.com/delete-account"},
+            },
+            "toolu_1",
+            {},
+        )
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_passed_in_guardrail_policy_can_deny(self, tmp_path):
+        browser_tool = BrowserTool(run_dir=tmp_path)
+        policy = GuardrailPolicy(mode="all", browser_tool=browser_tool)
+        options = make_options(tmp_path, browser_tool=browser_tool, guardrail_policy=policy)
+        pre_tool_use_hook = options.hooks["PreToolUse"][0].hooks[0]
+        result = await pre_tool_use_hook(
+            {
+                "tool_name": "mcp__browser_use__browser",
+                "tool_input": {"action": "navigate", "text": "https://example.com/delete-account"},
+            },
+            "toolu_1",
+            {},
+        )
+        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
 class TestModelResolution:
