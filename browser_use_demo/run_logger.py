@@ -55,6 +55,33 @@ class RunLogger:
     def log_error(self, message: str, context: str) -> None:
         self._append({"event": "error", "message": message, "context": context})
 
+    async def log_guardrail_block(
+        self,
+        *,
+        mode: str,
+        rule: str,
+        reason: str,
+        tool_name: Optional[str],
+        tool_input: Any,
+        allowed: bool,
+    ) -> None:
+        """A guardrail (see guardrails.py) matched a tool call. `allowed` is
+        True only for a manual-mode call that had a prior approval consumed
+        - a distinct, auditable event from a plain tool_error, since this is
+        specifically the "did the elevated-credential agent try something
+        the operator wanted gated" record an audit trail exists for."""
+        self._append(
+            {
+                "event": "guardrail_block",
+                "mode": mode,
+                "rule": rule,
+                "reason": reason,
+                "tool_name": tool_name,
+                "tool_input": tool_input,
+                "allowed": allowed,
+            }
+        )
+
     # --- Subagent fan-out events (called directly by DispatchSubagentsTool,
     # not via SDK hooks - these are independent ClaudeSDKClient sessions we
     # orchestrate ourselves, not the SDK's native subagent mechanism, so

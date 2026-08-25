@@ -13,6 +13,7 @@ from typing import Optional
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, HookMatcher
 
 from .agent_sdk_bridge import MAX_BUFFER_SIZE, build_mcp_server
+from .guardrails import GuardrailPolicy
 from .model_config import SUBAGENT_MODEL, VERIFY_MODEL
 from .model_config import resolve as resolve_model
 from .run_logger import RunLogger
@@ -73,6 +74,19 @@ Before presenting a finding as fact, check whether it's ALL THREE of: specific (
 </TIPS>"""
 
 
+def _combined_pre_tool_use_hook(run_logger: RunLogger, guardrail_policy: GuardrailPolicy):
+    """One PreToolUse hook function that does both jobs in a fixed order:
+    always log the call (run_logger), then let the guardrail decide whether
+    it's allowed - see the "PreToolUse" hooks= comment in build_options for
+    why this is one matcher instead of two."""
+
+    async def _hook(input_data: dict, tool_use_id, context) -> dict:
+        await run_logger.on_pre_tool_use(input_data, tool_use_id, context)
+        return await guardrail_policy.on_pre_tool_use(input_data, tool_use_id, context)
+
+    return _hook
+
+
 def build_options(
     *,
     model: str,
@@ -83,11 +97,23 @@ def build_options(
     api_key: str,
     max_turns: int = 200,
     max_budget_usd: Optional[float] = None,
+    guardrail_policy: Optional[GuardrailPolicy] = None,
 ) -> ClaudeAgentOptions:
-    """Build the SDK options for a browser-automation session."""
+    """Build the SDK options for a browser-automation session.
+
+    guardrail_policy: pass the caller's own GuardrailPolicy instance (see
+    guardrails.py) if it wants to own restriction-mode state across
+    reconnects (Streamlit does - it keeps one instance in session_state and
+    flips `.mode` in place from the sidebar toggle, with no client reconnect
+    needed for that to take effect). Defaults to a fresh "none" policy -
+    i.e. no behavior change for any caller that doesn't pass one.
+    """
     system_prompt = BROWSER_SYSTEM_PROMPT
     if system_prompt_suffix:
         system_prompt = f"{system_prompt} {system_prompt_suffix}"
+    guardrail_policy = guardrail_policy or GuardrailPolicy(
+        mode="none", browser_tool=browser_tool, run_logger=run_logger
+    )
 
     dispatch_subagents_tool = DispatchSubagentsTool(
         run_dir=browser_tool.run_dir,
@@ -152,7 +178,18 @@ def build_options(
         env={"ANTHROPIC_API_KEY": api_key},
         hooks={
             "UserPromptSubmit": [HookMatcher(hooks=[run_logger.on_user_prompt_submit])],
-            "PreToolUse": [HookMatcher(hooks=[run_logger.on_pre_tool_use])],
+            # One matcher, not two, so the guardrail decision doesn't depend
+            # on how the SDK/CLI combines multiple PreToolUse hooks on the
+            # same event (undocumented in the Python SDK) - logging always
+            # runs first, then the guardrail's allow/deny is the one that's
+            # actually returned.
+            "PreToolUse": [
+                HookMatcher(
+                    hooks=[
+                        _combined_pre_tool_use_hook(run_logger, guardrail_policy)
+                    ]
+                )
+            ],
             "PostToolUse": [HookMatcher(hooks=[run_logger.on_post_tool_use])],
             "PostToolUseFailure": [HookMatcher(hooks=[run_logger.on_post_tool_use_failure])],
             "Stop": [HookMatcher(hooks=[run_logger.on_stop])],
