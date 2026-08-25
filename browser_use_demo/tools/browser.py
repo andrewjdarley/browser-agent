@@ -153,18 +153,22 @@ FULL_PAGE_FALLBACK_VIEWPORTS = 4  # height of the top-of-page retry capture
 # nothing about whether a client-rendered page (React/Next.js apps, lazy images,
 # fade-in animations) has actually painted its content yet. Confirmed against a
 # real run where a screenshot taken immediately after navigate came back visibly
-# blank on a readyState-complete page. Flat hardcoded wait for now, not adaptive -
-# revisit with a real signal (network-idle, poll for non-empty content) if this
-# proves insufficient for some sites.
-SCREENSHOT_SETTLE_DELAY_S = 2.0
+# blank on a readyState-complete page - that page needed something closer to 2s.
+# Lowered from 2.0 to keep the common case (most pages settle well under this)
+# fast by default; the tradeoff is explicit rather than silent - the prompt now
+# promotes the standalone `wait` action for the slower-loading pages 0.5s isn't
+# enough for, instead of everyone paying a longer flat delay unconditionally.
+# Flat hardcoded wait, not adaptive - revisit with a real signal (network-idle,
+# poll for non-empty content) if 0.5s+prompted `wait` proves insufficient.
+SCREENSHOT_SETTLE_DELAY_S = 0.5
 
 # Same readyState-isn't-enough problem as above, but for text/DOM reads
 # (get_page_text, read_page, execute_js) rather than screenshots - confirmed
 # against real runs hitting a site's own transient "there was an error while
-# loading" placeholder text immediately after navigate. A shorter delay than
-# screenshots: these reads don't need a full visual paint, just enough time
-# for the initial client-side render to settle.
-TEXT_READ_SETTLE_DELAY_S = 1.5
+# loading" placeholder text immediately after navigate. Same tradeoff as
+# SCREENSHOT_SETTLE_DELAY_S above: lowered to keep the common case fast, with
+# the standalone `wait` action as the explicit escape hatch for slower pages.
+TEXT_READ_SETTLE_DELAY_S = 0.5
 
 # Directory containing browser tool utility files (JS scripts)
 BROWSER_TOOL_UTILS_DIR = Path(__file__).parent.parent / "browser_tool_utils"
