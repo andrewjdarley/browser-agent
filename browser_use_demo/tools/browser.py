@@ -11,8 +11,10 @@ import difflib
 import json
 import os
 import sys
+from collections import Counter, deque
 from pathlib import Path
 from typing import Any, Literal, Optional, TypedDict
+from urllib.parse import urlparse
 from uuid import uuid4
 
 from playwright.async_api import Browser, BrowserContext, Page
@@ -29,7 +31,7 @@ from .coordinate_scaling import CoordinateScaler
 BROWSER_TOOL_INPUT_SCHEMA: dict[str, Any] = {
     "properties": {
         "action": {
-            "description": 'The action to perform. The available actions are:\n* `navigate`: Navigate to a URL or use "back"/"forward" for browser history navigation. Automatically includes a screenshot of the loaded page.\n* `screenshot`: Take a screenshot of the current browser viewport.\n* `left_click`: Click the left mouse button at the specified coordinate or element reference.\n* `right_click`: Click the right mouse button at the specified coordinate or element reference.\n* `middle_click`: Click the middle mouse button at the specified coordinate or element reference.\n* `double_click`: Double-click the left mouse button at the specified coordinate or element reference.\n* `triple_click`: Triple-click the left mouse button at the specified coordinate or element reference.\n* `hover`: Move the mouse cursor to the specified coordinate or element reference without clicking. Useful for revealing tooltips, dropdown menus, or triggering hover states.\n* `left_click_drag`: Click and drag from start_coordinate to coordinate.\n* `left_mouse_down`: Press and hold the left mouse button at the specified coordinate.\n* `left_mouse_up`: Release the left mouse button at the specified coordinate.\n* `scroll`: Scroll the page in a specified direction.\n* `scroll_to`: Scroll to bring an element into view.\n* `type`: Type text at the current cursor position.\n* `key`: Press a key or key combination (supports standard keys and modifiers).\n* `hold_key`: Hold down a key or key combination for a specified duration.\n* `read_page`: Get the DOM tree structure, optionally filtered for interactive elements.\n* `find`: Semantically search the page for elements matching a description and return their refs (does not mark anything visually itself - use `outline` for that).\n* `outline`: Draw a bounding box around one element (by ref) and screenshot it, so it is visibly identifiable in the image - use right before treating an element as evidence for a specific/checkable claim, to visually confirm you have the right one.\n* `get_page_text`: Get all text content from the page.\n* `wait`: Wait for a specified duration in seconds.\n* `form_input`: Set the value of a form input element.\n* `zoom`: Take a zoomed screenshot of a specific region.\n* `execute_js`: Execute JavaScript code in the page context. Returns the result of the last expression.',
+            "description": 'The action to perform. The available actions are:\n* `navigate`: Navigate to a URL or use "back"/"forward" for browser history navigation. Automatically includes a screenshot of the loaded page.\n* `screenshot`: Take a screenshot of the current browser viewport.\n* `left_click`: Click the left mouse button at the specified coordinate or element reference.\n* `right_click`: Click the right mouse button at the specified coordinate or element reference.\n* `middle_click`: Click the middle mouse button at the specified coordinate or element reference.\n* `double_click`: Double-click the left mouse button at the specified coordinate or element reference.\n* `triple_click`: Triple-click the left mouse button at the specified coordinate or element reference.\n* `hover`: Move the mouse cursor to the specified coordinate or element reference without clicking. Useful for revealing tooltips, dropdown menus, or triggering hover states.\n* `left_click_drag`: Click and drag from start_coordinate to coordinate.\n* `left_mouse_down`: Press and hold the left mouse button at the specified coordinate.\n* `left_mouse_up`: Release the left mouse button at the specified coordinate.\n* `scroll`: Scroll the page in a specified direction.\n* `scroll_to`: Scroll to bring an element into view.\n* `type`: Type text at the current cursor position.\n* `key`: Press a key or key combination (supports standard keys and modifiers).\n* `hold_key`: Hold down a key or key combination for a specified duration.\n* `read_page`: Get the DOM tree structure, optionally filtered for interactive elements.\n* `find`: Semantically search the page for elements matching a description and return their refs (does not mark anything visually itself - use `outline` for that).\n* `outline`: Draw a bounding box around one element (by ref) and screenshot it, so it is visibly identifiable in the image - use right before treating an element as evidence for a specific/checkable claim, to visually confirm you have the right one.\n* `get_page_text`: Get all text content from the page.\n* `wait`: Wait for a specified duration in seconds.\n* `form_input`: Set the value of a form input element.\n* `zoom`: Take a zoomed screenshot of a specific region.\n* `execute_js`: Execute JavaScript code in the page context. Returns the result of the last expression.\n* `network_list_types`: Get a first-glance breakdown of captured network traffic this session, by resource type and by host - use this before network_list to know what to filter for.\n* `network_list`: List captured network responses (most recent first, capped), optionally filtered via `text` as a substring match against URL/method/resource type, or an exact status code. Use this to find a specific request (e.g. the XHR/fetch call that returned the JSON behind a client-rendered page) before inspecting it.\n* `network_inspect`: Get full detail (status, content-type, body if captured) for one specific response, by the id shown in `network_list`\'s output (pass it via `text`). Only JSON/XML/text/HTML bodies are captured automatically; binary responses are not. Useful both for finding otherwise-unreachable content (e.g. same-origin iframe content invisible to execute_js) and as a step in a scripted extraction to locate a JSON endpoint you can then hit directly.',
             "enum": [
                 "navigate",
                 "screenshot",
@@ -55,11 +57,14 @@ BROWSER_TOOL_INPUT_SCHEMA: dict[str, Any] = {
                 "form_input",
                 "zoom",
                 "execute_js",
+                "network_list_types",
+                "network_list",
+                "network_inspect",
             ],
             "type": "string",
         },
         "text": {
-            "description": 'Required for: `navigate` (URL or "back"/"forward"), `type` (text to type), `key` (key combination), `hold_key` (key to hold), `find` (text to search), `execute_js` (valid JavaScript code ONLY - no explanatory text, just the code). Optional for `read_page` (filter type: "interactive"), click actions (modifier keys to hold during click).',
+            "description": 'Required for: `navigate` (URL or "back"/"forward"), `type` (text to type), `key` (key combination), `hold_key` (key to hold), `find` (text to search), `execute_js` (valid JavaScript code ONLY - no explanatory text, just the code), `network_inspect` (the entry id from `network_list`, e.g. "n42"). Optional for `read_page` (filter type: "interactive"), click actions (modifier keys to hold during click), `network_list` (a substring/status-code match to filter by - omit to list the most recent captures unfiltered).',
             "type": "string",
         },
         "ref": {
@@ -120,7 +125,8 @@ Key actions:
 - scroll: Scroll the page
 - form_input: Fill form fields
 - outline: Draw a bounding box around an element (by ref) so it's visible in the screenshot
-- execute_js: Run JavaScript in page context"""
+- execute_js: Run JavaScript in page context
+- network_list_types, network_list, network_inspect: Inspect raw network traffic captured this session - find and read the response behind a request (e.g. the JSON an XHR call returned) even when it's not reachable through the rendered DOM"""
 
 
 OUTPUT_DIR = Path("/tmp/outputs")
@@ -169,6 +175,37 @@ class BrowserOptions(TypedDict):
     display_height_px: int
 
 
+class NetworkLogEntry(TypedDict):
+    id: str
+    url: str
+    method: str
+    status: int
+    resource_type: str
+    content_type: str
+    body: Optional[str]
+    body_truncated: bool
+
+
+# Rolling cap on captured responses - a long session can generate thousands;
+# oldest entries age out (deque(maxlen=...)) rather than growing unbounded.
+MAX_NETWORK_LOG_ENTRIES = 500
+
+# network_list's own output is capped separately (see MAX_NETWORK_LIST_RESULTS
+# below) - a page can fire hundreds of requests in one load, and dumping all
+# of them defeats the point of a filterable toolkit.
+MAX_NETWORK_LIST_RESULTS = 30
+
+# Body text is only captured for content-types worth reading as text - binary
+# payloads (images, fonts, media) are skipped entirely, both because they
+# aren't useful to inspect this way and to avoid holding large binary blobs
+# in memory for the life of the session.
+NETWORK_BODY_CONTENT_TYPE_PREFIXES = ("application/json", "application/xml", "text/")
+
+# A single captured body larger than this gets truncated - context-size
+# control, same reasoning as DOM_DIFF_MAX_CHARS below.
+MAX_NETWORK_BODY_CHARS = 20000
+
+
 Actions = Literal[
     "navigate",
     "screenshot",
@@ -194,6 +231,9 @@ Actions = Literal[
     "form_input",
     "zoom",
     "execute_js",
+    "network_list_types",
+    "network_list",
+    "network_inspect",
 ]
 
 # Actions that can plausibly change the page's DOM. Their results get an
@@ -227,6 +267,126 @@ DOM_MUTATING_ACTIONS = frozenset(
 # large diff (e.g. a client-routed SPA navigation that isn't a real
 # `navigate` call) is still useful context, but shouldn't be unbounded.
 DOM_DIFF_MAX_CHARS = 6000
+
+
+async def wait_for_page_ready(
+    page: Page,
+    *,
+    timeout_s: float = 3.0,
+    poll_interval: float = 0.3,
+    settle_delay_s: float = SCREENSHOT_SETTLE_DELAY_S,
+) -> None:
+    """Check whether a page has actually finished loading before reading it
+    (screenshot, text, JS); if not, wait briefly and re-check rather than
+    capturing a half-loaded page. Gives up after timeout_s - reading a
+    still-loading (or frozen) page is still better than not reading at all.
+
+    Wrapped in a hard asyncio.wait_for: if the page is genuinely frozen (JS
+    engine stuck, a blocking native dialog, etc.) a single page.evaluate()
+    call can hang indefinitely, which the elapsed-time bookkeeping alone
+    wouldn't catch - the outer timeout guarantees this always returns.
+
+    readyState alone isn't enough (see SCREENSHOT_SETTLE_DELAY_S) - after the
+    poll gives up or succeeds, wait settle_delay_s more before returning, so
+    the caller's read has a better chance of seeing actually-painted/settled
+    content. Factored out to take a Page directly (not self._page) so
+    tools/script_runner.py can reuse it for the per-item pages it drives
+    outside BrowserTool's own single-page session - see capture_screenshot
+    just below for the same reasoning.
+    """
+
+    async def _poll() -> None:
+        while True:
+            ready_state = await page.evaluate("document.readyState")
+            if ready_state == "complete":
+                return
+            await asyncio.sleep(poll_interval)
+
+    try:
+        await asyncio.wait_for(_poll(), timeout=timeout_s)
+    except Exception:
+        pass  # still loading, frozen, or navigated away mid-check - fall through
+
+    if settle_delay_s:
+        await asyncio.sleep(settle_delay_s)
+
+
+async def capture_screenshot(
+    page: Page, run_dir: Path, *, width: int, height: int, full_page: bool = False
+) -> ToolResult:
+    """Take a screenshot of a given Page and save it into run_dir, with the
+    same oversized-capture fallback chain BrowserTool._take_screenshot always
+    used: full page -> clipped to the top N viewports -> plain viewport,
+    whichever first comes in under MAX_SCREENSHOT_RAW_BYTES.
+
+    Factored out to take a Page (not self._page) so it's reusable by
+    anything that runs its own pages outside BrowserTool's single-page
+    session - see tools/script_runner.py, which runs one Page per item
+    concurrently and can't share BrowserTool's page across those.
+
+    Caller is responsible for any page-ready wait - this only captures.
+    """
+    try:
+        if full_page:
+            page_height = await page.evaluate("document.documentElement.scrollHeight")
+            if page_height > MAX_FULL_PAGE_HEIGHT_PX:
+                raise ToolError(
+                    f"Page is too tall for a full-page screenshot "
+                    f"({page_height}px > {MAX_FULL_PAGE_HEIGHT_PX}px limit, "
+                    f"likely an infinite-scroll page). Use scroll or "
+                    f"get_page_text instead."
+                )
+
+        screenshot_path = run_dir / f"screenshot_{uuid4().hex}.png"
+        truncation_note = ""
+        saved_note = f"Screenshot saved as {screenshot_path.name}\n"
+
+        if full_page:
+            await asyncio.wait_for(
+                page.screenshot(path=str(screenshot_path), full_page=True),
+                timeout=FULL_PAGE_SCREENSHOT_TIMEOUT_S,
+            )
+            if screenshot_path.stat().st_size > MAX_SCREENSHOT_RAW_BYTES:
+                clip_height = min(height * FULL_PAGE_FALLBACK_VIEWPORTS, page_height)
+                await page.screenshot(
+                    path=str(screenshot_path),
+                    clip={"x": 0, "y": 0, "width": width, "height": clip_height},
+                )
+                if screenshot_path.stat().st_size > MAX_SCREENSHOT_RAW_BYTES:
+                    # Still too big (rare - very dense visual content).
+                    # Fall back to a plain viewport screenshot, guaranteed small.
+                    await page.screenshot(path=str(screenshot_path), full_page=False)
+                    truncation_note = (
+                        "Note: this page was too large to capture in full even "
+                        "when clipped - showing only the current viewport. Use "
+                        "scroll or get_page_text for the rest of the page.\n"
+                    )
+                else:
+                    truncation_note = (
+                        f"Note: the full page was too large to send in one "
+                        f"screenshot, so this shows only the top {clip_height}px "
+                        f"(the part most likely to matter - headers, summaries, "
+                        f"metadata). Use scroll or get_page_text for content "
+                        f"further down the page.\n"
+                    )
+        else:
+            await page.screenshot(path=str(screenshot_path), full_page=False)
+
+        # Read the file and encode to base64
+        screenshot_bytes = screenshot_path.read_bytes()
+        image_base64 = base64.b64encode(screenshot_bytes).decode()
+
+        return ToolResult(output=saved_note + truncation_note, error=None, base64_image=image_base64)
+    except ToolError:
+        raise
+    except asyncio.TimeoutError as e:
+        raise ToolError(
+            f"Full-page screenshot timed out after "
+            f"{FULL_PAGE_SCREENSHOT_TIMEOUT_S}s (page may be lazy-loading "
+            f"content indefinitely). Use scroll or get_page_text instead."
+        ) from e
+    except Exception as e:
+        raise ToolError(f"Failed to take screenshot: {str(e)}") from e
 
 
 class BrowserTool:
@@ -274,6 +434,13 @@ class BrowserTool:
         # Last full DOM tree seen (via navigate or read_page) - the baseline
         # that DOM_MUTATING_ACTIONS get diffed against. See _attach_dom_context.
         self._last_dom_snapshot: Optional[str] = None
+        # Passive capture of every response this session, for the
+        # network_list_types/network_list/network_inspect actions - see
+        # _on_network_response. Persists across navigations (not cleared on
+        # navigate) so a request made just before navigating away is still
+        # inspectable afterward.
+        self._network_log: "deque[NetworkLogEntry]" = deque(maxlen=MAX_NETWORK_LOG_ENTRIES)
+        self._network_log_counter = 0
 
     @property
     def options(self) -> BrowserOptions:
@@ -374,6 +541,7 @@ class BrowserTool:
                 )
                 self._page = await self._context.new_page()
                 self._page.set_default_timeout(30000)
+                self._page.on("response", self._on_network_response)
 
                 print(
                     f"[Browser] Browser initialized with viewport: {viewport_width}x{viewport_height}",
@@ -427,39 +595,14 @@ class BrowserTool:
         poll_interval: float = 0.3,
         settle_delay_s: float = SCREENSHOT_SETTLE_DELAY_S,
     ) -> None:
-        """Check whether the page has actually finished loading before a
-        screenshot; if not, wait briefly and re-check rather than capturing a
-        half-loaded page. Gives up after timeout_s - a screenshot of a
-        still-loading (or frozen) page is still better than no screenshot.
-
-        Wrapped in a hard asyncio.wait_for: if the page is genuinely frozen
-        (JS engine stuck, a blocking native dialog, etc.) a single
-        page.evaluate() call can hang indefinitely, which the elapsed-time
-        bookkeeping alone wouldn't catch - the outer timeout guarantees this
-        always returns.
-
-        readyState alone isn't enough (see SCREENSHOT_SETTLE_DELAY_S) - after
-        the poll gives up or succeeds, wait settle_delay_s more before
-        returning, so the caller's screenshot has a better chance of showing
-        actually-painted content.
-        """
+        """See wait_for_page_ready (module-level) - this is a thin wrapper
+        bound to self._page, kept so existing call sites don't all need a
+        page argument."""
         if self._page is None:
             return
-
-        async def _poll() -> None:
-            while True:
-                ready_state = await self._page.evaluate("document.readyState")
-                if ready_state == "complete":
-                    return
-                await asyncio.sleep(poll_interval)
-
-        try:
-            await asyncio.wait_for(_poll(), timeout=timeout_s)
-        except Exception:
-            pass  # still loading, frozen, or navigated away mid-check - fall through
-
-        if settle_delay_s:
-            await asyncio.sleep(settle_delay_s)
+        await wait_for_page_ready(
+            self._page, timeout_s=timeout_s, poll_interval=poll_interval, settle_delay_s=settle_delay_s
+        )
 
     async def _take_screenshot(self, full_page: bool = False) -> ToolResult:
         """
@@ -469,72 +612,10 @@ class BrowserTool:
         """
         if self._page is None:
             raise ToolError("Browser not initialized")
-
-        try:
-            await self._wait_for_page_ready()
-
-            if full_page:
-                page_height = await self._page.evaluate(
-                    "document.documentElement.scrollHeight"
-                )
-                if page_height > MAX_FULL_PAGE_HEIGHT_PX:
-                    raise ToolError(
-                        f"Page is too tall for a full-page screenshot "
-                        f"({page_height}px > {MAX_FULL_PAGE_HEIGHT_PX}px limit, "
-                        f"likely an infinite-scroll page). Use scroll or "
-                        f"get_page_text instead."
-                    )
-
-            screenshot_path = self.run_dir / f"screenshot_{uuid4().hex}.png"
-            truncation_note = ""
-            saved_note = f"Screenshot saved as {screenshot_path.name}\n"
-
-            if full_page:
-                await asyncio.wait_for(
-                    self._page.screenshot(path=str(screenshot_path), full_page=True),
-                    timeout=FULL_PAGE_SCREENSHOT_TIMEOUT_S,
-                )
-                if screenshot_path.stat().st_size > MAX_SCREENSHOT_RAW_BYTES:
-                    clip_height = min(self.height * FULL_PAGE_FALLBACK_VIEWPORTS, page_height)
-                    await self._page.screenshot(
-                        path=str(screenshot_path),
-                        clip={"x": 0, "y": 0, "width": self.width, "height": clip_height},
-                    )
-                    if screenshot_path.stat().st_size > MAX_SCREENSHOT_RAW_BYTES:
-                        # Still too big (rare - very dense visual content).
-                        # Fall back to a plain viewport screenshot, guaranteed small.
-                        await self._page.screenshot(path=str(screenshot_path), full_page=False)
-                        truncation_note = (
-                            "Note: this page was too large to capture in full even "
-                            "when clipped - showing only the current viewport. Use "
-                            "scroll or get_page_text for the rest of the page.\n"
-                        )
-                    else:
-                        truncation_note = (
-                            f"Note: the full page was too large to send in one "
-                            f"screenshot, so this shows only the top {clip_height}px "
-                            f"(the part most likely to matter - headers, summaries, "
-                            f"metadata). Use scroll or get_page_text for content "
-                            f"further down the page.\n"
-                        )
-            else:
-                await self._page.screenshot(path=str(screenshot_path), full_page=False)
-
-            # Read the file and encode to base64
-            screenshot_bytes = screenshot_path.read_bytes()
-            image_base64 = base64.b64encode(screenshot_bytes).decode()
-
-            return ToolResult(output=saved_note + truncation_note, error=None, base64_image=image_base64)
-        except ToolError:
-            raise
-        except asyncio.TimeoutError as e:
-            raise ToolError(
-                f"Full-page screenshot timed out after "
-                f"{FULL_PAGE_SCREENSHOT_TIMEOUT_S}s (page may be lazy-loading "
-                f"content indefinitely). Use scroll or get_page_text instead."
-            ) from e
-        except Exception as e:
-            raise ToolError(f"Failed to take screenshot: {str(e)}") from e
+        await self._wait_for_page_ready()
+        return await capture_screenshot(
+            self._page, self.run_dir, width=self.width, height=self.height, full_page=full_page
+        )
 
     async def _zoom_screenshot(
         self, x: int, y: int, width: int, height: int
@@ -1139,6 +1220,157 @@ Source element: <{result.get("source", "unknown")}>
         except Exception as e:
             raise ToolError(f"Failed to get page text: {str(e)}") from e
 
+    def _on_network_response(self, response) -> None:
+        """Passive capture of every response, for the network_list_types/
+        network_list/network_inspect actions. Registered once per page via
+        page.on("response", ...) in _ensure_browser.
+
+        Playwright event handlers are invoked synchronously (not awaited), so
+        this only does synchronous work (response.status/.headers and
+        request.method/.resource_type are all available without an await);
+        the body - which does need an await - is captured separately via a
+        scheduled task in _capture_network_body, only for content-types
+        worth reading as text. Never lets a logging failure break the actual
+        page interaction that triggered the request.
+        """
+        try:
+            request = response.request
+            self._network_log_counter += 1
+            content_type = response.headers.get("content-type", "")
+            entry: NetworkLogEntry = {
+                "id": f"n{self._network_log_counter}",
+                "url": response.url,
+                "method": request.method,
+                "status": response.status,
+                "resource_type": request.resource_type,
+                "content_type": content_type,
+                "body": None,
+                "body_truncated": False,
+            }
+            self._network_log.append(entry)
+            if content_type.startswith(NETWORK_BODY_CONTENT_TYPE_PREFIXES):
+                asyncio.create_task(self._capture_network_body(entry, response))
+        except Exception:
+            pass
+
+    async def _capture_network_body(self, entry: NetworkLogEntry, response) -> None:
+        """Fills in entry["body"] after the fact - response.text() needs an
+        await, so this runs as a separate task scheduled from the sync
+        _on_network_response handler. If the entry has already aged out of
+        _network_log (evicted by the deque's maxlen) by the time this
+        completes, the update is harmless - just wasted work on a dict
+        nothing references anymore."""
+        try:
+            body = await response.text()
+        except Exception:
+            # Body already consumed, non-text encoding, connection closed
+            # before it could be read, etc. - leave body as None; network_inspect
+            # reports this as "not captured" rather than erroring.
+            return
+        if len(body) > MAX_NETWORK_BODY_CHARS:
+            entry["body"] = body[:MAX_NETWORK_BODY_CHARS]
+            entry["body_truncated"] = True
+        else:
+            entry["body"] = body
+
+    async def _network_list_types(self) -> ToolResult:
+        """A first-glance map of the page's traffic - counts by resource
+        type and by host - before drilling in with network_list/
+        network_inspect. Deliberately not a full request dump; see those
+        two actions for that."""
+        if not self._network_log:
+            return ToolResult(
+                output="No network activity captured yet - responses are only logged from "
+                "when the browser session started, so navigate somewhere first."
+            )
+
+        by_type = Counter(e["resource_type"] or "unknown" for e in self._network_log)
+        by_host = Counter(urlparse(e["url"]).netloc for e in self._network_log)
+
+        lines = [f"{len(self._network_log)} response(s) captured this session.", "", "By resource type:"]
+        for rtype, count in by_type.most_common():
+            lines.append(f"  {rtype}: {count}")
+        lines.append("")
+        lines.append("By host:")
+        for host, count in by_host.most_common(15):
+            lines.append(f"  {host}: {count}")
+        if len(by_host) > 15:
+            lines.append(f"  ... and {len(by_host) - 15} more host(s)")
+        return ToolResult(output="\n".join(lines))
+
+    async def _network_list(self, match: Optional[str]) -> ToolResult:
+        """List captured responses, most recent first, optionally filtered
+        by a substring match against URL, method, resource type, or an
+        exact status code. Capped at MAX_NETWORK_LIST_RESULTS - narrow the
+        match to see more specific results rather than relying on this to
+        surface everything at once (the whole reason this is split from
+        network_list_types: a page can fire hundreds of requests, most of
+        them irrelevant to what you're actually looking for)."""
+        entries = list(self._network_log)
+        if match:
+            match_lower = match.lower()
+            entries = [
+                e
+                for e in entries
+                if match_lower in e["url"].lower()
+                or match_lower in e["method"].lower()
+                or match_lower in (e["resource_type"] or "").lower()
+                or match_lower == str(e["status"])
+            ]
+
+        if not entries:
+            if match:
+                return ToolResult(output=f"No captured responses matched {match!r}.")
+            return ToolResult(output="No network activity captured yet.")
+
+        total = len(entries)
+        shown = entries[-MAX_NETWORK_LIST_RESULTS:]
+        header = f"{total} matching response(s)"
+        if match:
+            header += f" for {match!r}"
+        header += f", showing {len(shown)} most recent:"
+        lines = [header, ""]
+        for e in shown:
+            body_note = ""
+            if e["body"] is not None:
+                body_note = " [body captured, truncated]" if e["body_truncated"] else " [body captured]"
+            lines.append(f"{e['id']} | {e['status']} {e['method']} {e['resource_type']} | {e['url']}{body_note}")
+        if total > len(shown):
+            lines.append(f"... {total - len(shown)} more not shown - narrow your match to see them")
+        return ToolResult(output="\n".join(lines))
+
+    async def _network_inspect(self, entry_id: str) -> ToolResult:
+        """Full detail (status, headers summary, body if captured) for one
+        specific response, by the id shown in network_list's output."""
+        entry = next((e for e in self._network_log if e["id"] == entry_id), None)
+        if entry is None:
+            raise ToolError(
+                f"No captured response with id {entry_id!r} - call network_list first to "
+                f"find a valid id (only the most recent {MAX_NETWORK_LOG_ENTRIES} responses "
+                "this session are kept)."
+            )
+
+        lines = [
+            f"{entry['method']} {entry['url']}",
+            f"Status: {entry['status']}",
+            f"Resource type: {entry['resource_type']}",
+            f"Content-Type: {entry['content_type'] or '(none)'}",
+            "",
+        ]
+        if entry["body"] is not None:
+            lines.append("Body:")
+            lines.append(entry["body"])
+            if entry["body_truncated"]:
+                lines.append(f"\n[truncated at {MAX_NETWORK_BODY_CHARS} chars]")
+        else:
+            lines.append(
+                "Body: not captured. Only JSON/XML/text/HTML responses are captured "
+                "automatically (binary/image/font/media responses are skipped by design); "
+                "a body can also be briefly unavailable if the response hadn't finished "
+                "loading yet when this was logged - try again in a moment."
+            )
+        return ToolResult(output="\n".join(lines))
+
     async def _find(self, search_query: str) -> ToolResult:
         """Find elements on the page matching the search query using AI."""
         if self._page is None:
@@ -1551,6 +1783,17 @@ ERROR: explanation of why no elements were found"""
             if not text:
                 raise ToolError("JavaScript code is required for execute_js action")
             return await self._execute_js(text)
+
+        elif action == "network_list_types":
+            return await self._network_list_types()
+
+        elif action == "network_list":
+            return await self._network_list(text)
+
+        elif action == "network_inspect":
+            if not text:
+                raise ToolError("Entry id (from network_list) is required for network_inspect action")
+            return await self._network_inspect(text)
 
         else:
             raise ToolError(f"Unknown action: {action}")

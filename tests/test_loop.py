@@ -40,6 +40,7 @@ class TestBuildOptions:
             "mcp__browser_use__save_file",
             "mcp__browser_use__dispatch_subagents",
             "mcp__browser_use__batch_extract",
+            "mcp__browser_use__run_script",
             "mcp__browser_use__verify_finding",
         ]
 
@@ -85,13 +86,17 @@ class TestBuildOptions:
         assert "immediately-invoked function" in BROWSER_SYSTEM_PROMPT
         assert "top-level `return`" in BROWSER_SYSTEM_PROMPT
 
-    def test_prompt_defaults_to_batch_extract_for_concurrency(self):
+    def test_prompt_defaults_to_run_script_for_scripted_tasks(self):
         # Regression guard: a real run's hand-written execute_js fetch()
         # loop failed outright ("Failed to fetch" on every request) from a
-        # page context that doesn't tolerate arbitrary fetches - batch_extract
-        # (isolated from page context) should be the stated default, not a
-        # same-origin-only alternative to a manual fetch loop.
-        assert "Default to batch_extract for concurrent multi-URL fetching" in BROWSER_SYSTEM_PROMPT
+        # page context that doesn't tolerate arbitrary fetches - a tool
+        # isolated from page context (now run_script, which subsumes
+        # batch_extract's own mechanism as its no-navigate fast path) should
+        # be the stated default, not a same-origin-only manual fetch loop.
+        assert "Default to run_script for this" in BROWSER_SYSTEM_PROMPT
+        # batch_extract still exists and is still mentioned as a narrower
+        # standalone alternative, not silently dropped from the guidance.
+        assert "batch_extract" in BROWSER_SYSTEM_PROMPT
 
     def test_hooks_registered_for_run_logger(self, tmp_path):
         options = make_options(tmp_path)

@@ -18,6 +18,7 @@ from .model_config import resolve as resolve_model
 from .run_logger import RunLogger
 from .tools import BrowserTool, FileOutputTool
 from .tools.batch_extract import BatchExtractTool, build_batch_extract_tool_fn
+from .tools.script_runner import ScriptRunnerTool, build_run_script_tool_fn
 from .tools.subagent import DispatchSubagentsTool, build_dispatch_subagents_tool_fn
 from .tools.verify import MAX_VERIFICATIONS_PER_SESSION, VerifyFindingTool, build_verify_finding_tool_fn
 
@@ -38,11 +39,15 @@ Screenshots are for exactly two things: an explicitly requested visual deliverab
 
 Two different ways to locate something on a page, for two different needs. When you're looking for something by description ("the search box", "the citation that mentions Beevor") rather than an exact position, use find - it does semantic matching over the whole page for you. When you need an exact position or count ("item number N in a list"), that's a precise-counting problem, not a description-matching one - find isn't reliable for this (it's an LLM eyeballing a large dump of the page, which is exactly the kind of counting task LLMs get wrong), so write execute_js instead, and don't assume your selector's scope without checking it. If your execute_js code has more than one statement, or uses `return`, wrap it in an immediately-invoked function - `(() => {{ ...; return x; }})()` - not bare statements at the top level. A top-level `return` outside a function is a JavaScript syntax error and the call will fail immediately; this has been a repeated, avoidable failure. A single expression (e.g. `document.title`) doesn't need wrapping. A class-based selector (e.g. ".references li") matches descendants of EVERY element with that class combined into one list, even if there are multiple separate ones on the page (e.g. a short "Notes" list and a long "References" list can share the same class) - so indexing into it can silently land in the wrong place. Before trusting a positional index: confirm how many distinct containers your selector's root actually matches and that you've picked the right one specifically (e.g. query the containers themselves first - document.querySelectorAll('ol.references') - and pick the one whose size matches what you expect), then cross-check the specific element you land on against something you can directly observe (its actually-rendered/visible text, or an outline screenshot - see below) before treating it as the answer - don't stop at the first result that runs without erroring.
 
+When content genuinely isn't reachable through the DOM at all - not just hard to find, but actually absent from it - use network_list_types, network_list, and network_inspect instead of digging further with execute_js/read_page. Two concrete cases where this matters: a same-origin iframe's content (execute_js/page.evaluate only ever touches the top frame, so that content is invisible to every DOM-reading action no matter how you query it, even though the iframe's own URL is visible); and a client-rendered page where the data you want only exists in a JSON response, never in the rendered HTML (the same class of page batch_extract can't read - see below). Start with network_list_types for a first-glance breakdown of what traffic exists, narrow down with network_list (filter by a URL/status/type substring), then network_inspect the specific response's body once you've found it. This reads raw HTTP responses, not what got rendered - a fundamentally different source of truth than every DOM-based action above, not a fallback flavor of the same thing.
+
 When you have a batch of items that genuinely need per-item reasoning or interaction (forms, multi-step flows, judgment calls) - not just data extraction - use dispatch_subagents instead of processing them one at a time in a loop: it runs them concurrently, each with its own browser tab, all following the same shared instructions you give it. For pure data extraction at scale, see the scripting guidance below instead - it's far cheaper per item.
 
 Don't scroll blindly in small increments to explore a page. If you don't already know exactly where your target is, call read_page (or re-check it) to find an element ref, or scroll_to a major structural landmark (a section heading, a "load more" control, etc.) and look at what's there - then decide your next move from what you actually see. Only use plain directional scroll when you're confident you're already close to the target and it'll take at most one or two calls to get there. If you're scrolling repeatedly without a specific ref in mind, stop and look at the DOM instead.
 
-If a task involves several similar items and manually repeating the same steps on each would clearly take many tool calls, script it instead - this is a normal, common solution, not a last resort. Whether that's worth it depends on per-item effort as much as item count: even 5-10 items can be worth scripting if each requires several steps by hand. First inspect one example page to work out the extraction logic. Iterating on the extraction JS - try it, look at what came back, fix it, try again - against that one page before applying it to the rest is expected; don't expect to get it right in one attempt. Default to batch_extract for concurrent multi-URL fetching, same-origin or not - it fetches many URLs concurrently (reusing your logged-in session, with built-in backoff if a site starts rate-limiting you) and runs your extraction JS against each one, isolated from whatever page you currently happen to be on. Writing your own execute_js fetch() + Promise.all loop instead is not just narrower (same-origin only) - it also depends on the current page's own context, which can silently and unpredictably break it: fetch() calls have been observed failing outright (not from rate-limiting - a hard "Failed to fetch" on every request) when run from a page a browser renders specially, like a raw JSON API response. Reach for a manual fetch loop only when you specifically need it to run against the live current page's own state (e.g. an authenticated fetch that must reuse in-page JS variables). batch_extract only sees server-rendered HTML, not content that appears after client-side JS runs - if the data you need isn't in the raw page source, fall back to dispatch_subagents or manual navigation instead.
+If a task involves several similar items and manually repeating the same steps on each would clearly take many tool calls, script it instead - this is a normal, common solution, not a last resort. Whether that's worth it depends on per-item effort as much as item count: even 5-10 items can be worth scripting if each requires several steps by hand. First inspect one example page/item manually to work out the recipe. Iterating on it - try it, look at what came back, fix it, try again - against that one example before applying it to the rest is expected; don't expect to get it right in one attempt.
+
+Default to run_script for this: it replays a fixed sequence of steps (same action names as this tool - navigate, screenshot, get_page_text, execute_js, wait) once per item, over a pool of pages from your current session (inherits cookies/login), with no LLM cost per item. Whether it fetches or renders falls out of what you put in the script, not a separate choice: a script with no navigate step fetches each item as a URL via raw HTTP (fast, but only sees server-rendered HTML, not content that appears after client-side JS runs - same mechanism and same limitation as batch_extract, since that's literally what this is under the hood); a script that starts with navigate gets a real rendered page per item, so screenshot/get_page_text/JS that depends on client-rendering all work. batch_extract still exists as a narrower standalone tool for the fetch-only case if you prefer it, but run_script covers everything it does plus the render+screenshot case in one place. If the data you need isn't in a page's raw source and you don't want to pay render cost per item, try network_list/network_inspect first to find the JSON endpoint actually behind it (often hittable directly, still cheap) - the browser tool's execute_js fetch() + Promise.all is also an option for same-origin bulk calls against the CURRENT page specifically (not run_script's per-item pages), but depends on that page's own context in ways that can silently break (fetch() has been observed failing outright - a hard "Failed to fetch" on every request - when run from a page a browser renders specially, like a raw JSON API response). None of these tools support real per-item interaction or judgment (forms, multi-step flows, deciding what to click) - that's still dispatch_subagents.
 
 When you need to hand the user a deliverable file (a CSV, a report, extracted data), use the save_file tool. Don't try to trigger a browser download via execute_js - that saves inside the automated browser's own environment, not somewhere the user can find it.
 
@@ -93,6 +98,10 @@ def build_options(
         browser_tool=browser_tool,
         file_output_tool=file_output_tool,
     )
+    script_runner_tool = ScriptRunnerTool(
+        browser_tool=browser_tool,
+        file_output_tool=file_output_tool,
+    )
     verify_finding_tool = VerifyFindingTool(
         run_dir=browser_tool.run_dir,
         run_logger=run_logger,
@@ -106,6 +115,7 @@ def build_options(
         extra_tools=[
             build_dispatch_subagents_tool_fn(dispatch_subagents_tool),
             build_batch_extract_tool_fn(batch_extract_tool),
+            build_run_script_tool_fn(script_runner_tool),
             build_verify_finding_tool_fn(verify_finding_tool),
         ],
     )
@@ -131,6 +141,7 @@ def build_options(
             "mcp__browser_use__save_file",
             "mcp__browser_use__dispatch_subagents",
             "mcp__browser_use__batch_extract",
+            "mcp__browser_use__run_script",
             "mcp__browser_use__verify_finding",
         ],
         max_turns=max_turns,
