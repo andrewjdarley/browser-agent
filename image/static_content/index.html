@@ -24,6 +24,12 @@
                 border: none;
                 height: 100vh;
             }
+            .queue {
+                flex: 1;
+                border: none;
+                height: 100vh;
+                border-left: 1px solid #444;
+            }
         </style>
     </head>
     <body>
@@ -37,6 +43,11 @@
                 id="vnc"
                 src="http://127.0.0.1:6080/vnc.html?&resize=scale&autoconnect=1&view_only=1&reconnect=1&reconnect_delay=2000"
                 class="right"
+                allow="fullscreen"
+            ></iframe>
+            <iframe
+                src="http://localhost:8501/?view=queue"
+                class="queue"
                 allow="fullscreen"
             ></iframe>
             <button
