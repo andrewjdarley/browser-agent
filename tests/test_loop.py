@@ -101,9 +101,33 @@ class TestBuildOptions:
         # isolated from page context (now run_script, which subsumes
         # batch_extract's own mechanism as its no-navigate fast path) should
         # be the stated default, not a same-origin-only manual fetch loop.
-        assert "Default to run_script for this" in BROWSER_SYSTEM_PROMPT
+        assert "Default to run_script for get_page_text/execute_js data extraction" in BROWSER_SYSTEM_PROMPT
         # batch_extract still exists and is still mentioned as a narrower
         # standalone alternative, not silently dropped from the guidance.
+        assert "batch_extract" in BROWSER_SYSTEM_PROMPT
+
+    def test_prompt_forks_run_script_vs_queue_screenshots_on_scale(self):
+        # Regression guard, in two parts. First: a real run asked for
+        # "full-page screenshot of the 25 most recent merged PRs" (screenshot
+        # only, no data extraction) and the agent used run_script, not
+        # queue_screenshots - initially read as a miss, but on reflection a
+        # batch of 25 that finishes in well under a minute is exactly where
+        # run_script's simpler blocking-then-one-result model is the right
+        # call, not queue_screenshots' extra moving parts (a queue, a live
+        # panel, separate status polling). Second: queue_screenshots' actual
+        # value - live visibility into a long-running batch without a human
+        # sitting on one giant blocking call - only pays for itself at real
+        # scale, so the guidance needs an explicit scale threshold (roughly
+        # 100+ items) rather than "screenshot-only, always prefer
+        # queue_screenshots" full stop.
+        assert "roughly 100+ items" in BROWSER_SYSTEM_PROMPT
+        assert "run_script's simplicity is the better trade" in BROWSER_SYSTEM_PROMPT
+        # The scale fork must appear before run_script's own pitch, not
+        # after - otherwise the model anchors on run_script's default
+        # framing first, the same failure mode as the original miss.
+        assert BROWSER_SYSTEM_PROMPT.index("roughly 100+ items") < BROWSER_SYSTEM_PROMPT.index(
+            "Default to run_script for get_page_text/execute_js data extraction"
+        )
         assert "batch_extract" in BROWSER_SYSTEM_PROMPT
 
     def test_hooks_registered_for_run_logger(self, tmp_path):
