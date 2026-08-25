@@ -114,7 +114,6 @@ def setup_state():
         "rendered_message_count": 0,  # Track rendered messages to avoid re-rendering
         "last_error": None,  # Store last error message to display persistently
         "restriction_mode": "none",  # Guardrail toggle - see the sidebar widget below
-        "max_subbrowser_fanout": 8,  # Sub-browser queue toggle - see the sidebar widget below
         # API Configuration
         "api_key": os.environ.get("ANTHROPIC_API_KEY", ""),
         "max_turns": 200,
@@ -869,29 +868,13 @@ def main():
         )
         st.session_state.guardrail_policy.mode = st.session_state.restriction_mode
 
-        # Sub-browser screenshot queue - fanout control. Mutated in place on
-        # the shared SubBrowserQueue instance, same reasoning as the
-        # guardrail toggle above (no client reconnect needed for it to
-        # apply). Live grid is its own dedicated page (/?view=queue,
-        # embedded as index.html's third pane) rather than in-app, so it
-        # gets real space next to the chat instead of sharing it - see
-        # render_queue_only_view/render_sub_browser_panel.
-        st.divider()
-        st.subheader("🧪 Sub-browser Queue")
-        st.number_input(
-            "Max Sub-browser Fanout",
-            min_value=1,
-            max_value=32,
-            value=st.session_state.max_subbrowser_fanout,
-            step=1,
-            key="max_subbrowser_fanout",
-            help=(
-                "How many queue_screenshots items run concurrently at once. Watch them "
-                "live at /?view=queue (the far-right pane if you loaded this via "
-                "index.html's combined view)."
-            ),
-        )
-        st.session_state.sub_browser_queue.max_fanout = st.session_state.max_subbrowser_fanout
+        # No sidebar control for the sub-browser queue's fanout/pacing - it
+        # never had anything worth showing here (the live grid lives at
+        # /?view=queue, embedded as index.html's third pane - see
+        # render_queue_only_view/render_sub_browser_panel), and max_fanout/
+        # min_interval_s are now agent-settable directly via queue_screenshots'
+        # own arguments (see tools/sub_browser_queue.py) instead of a human
+        # dialing in a fixed value up front.
 
         # Conversation Management Section
         st.divider()

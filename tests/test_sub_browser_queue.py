@@ -114,7 +114,7 @@ async def drain(queue: SubBrowserQueue, timeout: float = 2.0):
 class TestAddAndExecution:
     @pytest.mark.asyncio
     async def test_add_returns_ids_immediately_without_waiting(self, tmp_path):
-        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path)
+        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path, min_interval_s=0)
         ids = queue.add([[{"action": "navigate", "url": "example.com"}]])
         # add() is synchronous and returns before anything actually runs -
         # the fire-and-forget contract queue_screenshots' tool fn relies on.
@@ -123,7 +123,7 @@ class TestAddAndExecution:
 
     @pytest.mark.asyncio
     async def test_navigate_then_screenshot_produces_a_saved_file(self, tmp_path):
-        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path)
+        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path, min_interval_s=0)
         queue.add([[{"action": "navigate", "url": "example.com"}, {"action": "screenshot"}]])
         await drain(queue)
 
@@ -136,7 +136,7 @@ class TestAddAndExecution:
 
     @pytest.mark.asyncio
     async def test_navigate_prepends_https_when_no_scheme(self, tmp_path):
-        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path)
+        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path, min_interval_s=0)
         queue.add([[{"action": "navigate", "url": "example.com"}]])
         await drain(queue)
 
@@ -145,7 +145,7 @@ class TestAddAndExecution:
 
     @pytest.mark.asyncio
     async def test_navigate_leaves_full_url_untouched(self, tmp_path):
-        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path)
+        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path, min_interval_s=0)
         queue.add([[{"action": "navigate", "url": "http://example.com/page"}]])
         await drain(queue)
         item = queue.snapshot()["completed"][0]
@@ -166,7 +166,7 @@ class TestAddAndExecution:
             page.get_by_text = MagicMock(side_effect=spy)
             return page
 
-        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path, page_factory), run_dir=tmp_path)
+        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path, page_factory), run_dir=tmp_path, min_interval_s=0)
         queue.add([[{"action": "navigate", "url": "example.com"}, {"action": "scroll_to", "target": "Pricing"}]])
         await drain(queue)
 
@@ -176,7 +176,7 @@ class TestAddAndExecution:
 
     @pytest.mark.asyncio
     async def test_full_page_screenshot_flag_recorded_in_log(self, tmp_path):
-        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path)
+        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path, min_interval_s=0)
         queue.add([[{"action": "navigate", "url": "example.com"}, {"action": "screenshot", "full_page": True}]])
         await drain(queue)
         item = queue.snapshot()["completed"][0]
@@ -184,7 +184,7 @@ class TestAddAndExecution:
 
     @pytest.mark.asyncio
     async def test_multiple_screenshots_in_one_item_all_collected(self, tmp_path):
-        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path)
+        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path, min_interval_s=0)
         queue.add(
             [
                 [
@@ -205,7 +205,7 @@ class TestAddAndExecution:
 class TestErrorIsolation:
     @pytest.mark.asyncio
     async def test_unsupported_action_fails_just_that_item(self, tmp_path):
-        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path)
+        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path, min_interval_s=0)
         queue.add(
             [
                 [{"action": "click_something_unsupported"}],
@@ -223,7 +223,7 @@ class TestErrorIsolation:
             raise RuntimeError("net::ERR_NAME_NOT_RESOLVED")
 
         bt = make_browser_tool(tmp_path, page_factory=lambda: make_fake_page(goto_side_effect=failing_goto))
-        queue = SubBrowserQueue(browser_tool=bt, run_dir=tmp_path)
+        queue = SubBrowserQueue(browser_tool=bt, run_dir=tmp_path, min_interval_s=0)
         queue.add([[{"action": "navigate", "url": "nonexistent.invalid"}]])
         await drain(queue)
 
@@ -235,7 +235,7 @@ class TestErrorIsolation:
     async def test_page_open_failure_recorded_as_item_error(self, tmp_path):
         bt = make_browser_tool(tmp_path)
         bt._context.new_page = AsyncMock(side_effect=RuntimeError("browser crashed"))
-        queue = SubBrowserQueue(browser_tool=bt, run_dir=tmp_path)
+        queue = SubBrowserQueue(browser_tool=bt, run_dir=tmp_path, min_interval_s=0)
         queue.add([[{"action": "navigate", "url": "example.com"}]])
         await drain(queue)
 
@@ -256,7 +256,7 @@ class TestConcurrency:
             return MagicMock(status=200, headers={})
 
         bt = make_browser_tool(tmp_path, page_factory=lambda: make_fake_page(goto_side_effect=blocking_goto))
-        queue = SubBrowserQueue(browser_tool=bt, run_dir=tmp_path, max_fanout=2)
+        queue = SubBrowserQueue(browser_tool=bt, run_dir=tmp_path, max_fanout=2, min_interval_s=0)
         queue.add([[{"action": "navigate", "url": f"example.com/{i}"}] for i in range(5)])
 
         loop = asyncio.get_event_loop()
@@ -275,11 +275,64 @@ class TestConcurrency:
     @pytest.mark.asyncio
     async def test_finishing_an_item_immediately_starts_the_next_pending_one(self, tmp_path):
         queue = SubBrowserQueue(
-            browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path, max_fanout=1
+            browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path, max_fanout=1, min_interval_s=0
         )
         queue.add([[{"action": "navigate", "url": f"example.com/{i}"}] for i in range(3)])
         await drain(queue)
         assert len(queue.snapshot()["completed"]) == 3
+
+
+class TestThrottle:
+    """min_interval_s - a pacing throttle independent of max_fanout, added
+    after a real batch against several distinct sites got one of them to
+    start rate-limiting the whole run: max_fanout alone caps how many items
+    run AT ONCE, but not how fast new ones start as slots free up (or even
+    how fast the first max_fanout items start together)."""
+
+    @pytest.mark.asyncio
+    async def test_default_paces_item_starts(self, tmp_path):
+        # No min_interval_s passed - exercises the real default
+        # (DEFAULT_MIN_INTERVAL_S), not an explicitly-zeroed one.
+        starts = []
+
+        async def recording_goto(url, **kwargs):
+            starts.append(asyncio.get_event_loop().time())
+            return MagicMock(status=200, headers={})
+
+        bt = make_browser_tool(tmp_path, page_factory=lambda: make_fake_page(goto_side_effect=recording_goto))
+        queue = SubBrowserQueue(browser_tool=bt, run_dir=tmp_path, max_fanout=8)
+        queue.add([[{"action": "navigate", "url": f"example.com/{i}"}] for i in range(3)])
+        await drain(queue, timeout=5.0)
+
+        assert len(starts) == 3
+        gaps = [b - a for a, b in zip(starts, starts[1:])]
+        assert all(gap >= queue.min_interval_s - 0.05 for gap in gaps), gaps
+
+    @pytest.mark.asyncio
+    async def test_min_interval_s_zero_starts_immediately(self, tmp_path):
+        # Explicit 0 should behave like the old unthrottled default -
+        # max_fanout alone still gates concurrency, but starts within one
+        # batch aren't paced apart.
+        queue = SubBrowserQueue(
+            browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path, max_fanout=8, min_interval_s=0
+        )
+        queue.add([[{"action": "navigate", "url": f"example.com/{i}"}] for i in range(5)])
+        await asyncio.sleep(0.05)
+        assert queue.snapshot()["in_progress_count"] == 5
+
+    @pytest.mark.asyncio
+    async def test_queue_screenshots_tool_can_raise_the_throttle(self, tmp_path):
+        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path, min_interval_s=0)
+        fn = build_queue_screenshots_tool_fn(queue)
+        await fn.handler({"items": [[{"action": "navigate", "url": "example.com"}]], "min_interval_s": 3.0})
+        assert queue.min_interval_s == 3.0
+
+    @pytest.mark.asyncio
+    async def test_queue_screenshots_tool_can_change_max_fanout(self, tmp_path):
+        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path, min_interval_s=0)
+        fn = build_queue_screenshots_tool_fn(queue)
+        await fn.handler({"items": [[{"action": "navigate", "url": "example.com"}]], "max_fanout": 2})
+        assert queue.max_fanout == 2
 
 
 class TestLivePreviews:
@@ -290,7 +343,7 @@ class TestLivePreviews:
 
     @pytest.mark.asyncio
     async def test_empty_queue_returns_no_previews(self, tmp_path):
-        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path)
+        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path, min_interval_s=0)
         assert await queue.capture_live_previews() == {}
 
     @pytest.mark.asyncio
@@ -302,7 +355,7 @@ class TestLivePreviews:
             return MagicMock(status=200, headers={})
 
         bt = make_browser_tool(tmp_path, page_factory=lambda: make_fake_page(goto_side_effect=blocking_goto))
-        queue = SubBrowserQueue(browser_tool=bt, run_dir=tmp_path)
+        queue = SubBrowserQueue(browser_tool=bt, run_dir=tmp_path, min_interval_s=0)
         [item_id] = queue.add([[{"action": "navigate", "url": "example.com"}]])
 
         # Give _run_item a chance to open its page and register it as live,
@@ -333,7 +386,7 @@ class TestLivePreviews:
         page = make_fake_page(goto_side_effect=blocking_goto)
         page.screenshot = AsyncMock(side_effect=RuntimeError("page is navigating"))
         bt = make_browser_tool(tmp_path, page_factory=lambda: page)
-        queue = SubBrowserQueue(browser_tool=bt, run_dir=tmp_path)
+        queue = SubBrowserQueue(browser_tool=bt, run_dir=tmp_path, min_interval_s=0)
         queue.add([[{"action": "navigate", "url": "example.com"}]])
 
         loop = asyncio.get_event_loop()
@@ -356,7 +409,7 @@ class TestLivePreviews:
             return MagicMock(status=200, headers={})
 
         bt = make_browser_tool(tmp_path, page_factory=lambda: make_fake_page(goto_side_effect=blocking_goto))
-        queue = SubBrowserQueue(browser_tool=bt, run_dir=tmp_path, max_fanout=1)
+        queue = SubBrowserQueue(browser_tool=bt, run_dir=tmp_path, max_fanout=1, min_interval_s=0)
         queue.pause()
         queue.add([[{"action": "navigate", "url": "example.com"}]])
 
@@ -380,7 +433,7 @@ class TestLivePreviews:
 class TestPauseResumeClear:
     @pytest.mark.asyncio
     async def test_pause_prevents_new_items_from_starting(self, tmp_path):
-        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path)
+        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path, min_interval_s=0)
         queue.pause()
         queue.add([[{"action": "navigate", "url": "example.com"}]])
         await asyncio.sleep(0.1)  # give it a real chance to (wrongly) start, if it were going to
@@ -393,7 +446,7 @@ class TestPauseResumeClear:
 
     @pytest.mark.asyncio
     async def test_resume_starts_queued_items(self, tmp_path):
-        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path)
+        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path, min_interval_s=0)
         queue.pause()
         queue.add([[{"action": "navigate", "url": "example.com"}]])
         queue.resume()
@@ -401,7 +454,7 @@ class TestPauseResumeClear:
         assert len(queue.snapshot()["completed"]) == 1
 
     def test_clear_drops_pending_and_completed(self, tmp_path):
-        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path)
+        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path, min_interval_s=0)
         queue.pause()
         queue.add([[{"action": "navigate", "url": "example.com"}]] * 3)
         queue._completed.append({"id": "old", "status": "done", "screenshots": [], "log": [], "error": None})
@@ -413,7 +466,7 @@ class TestPauseResumeClear:
         assert snap["completed"] == []
 
     def test_clear_does_not_touch_in_progress(self, tmp_path):
-        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path)
+        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path, min_interval_s=0)
         queue._in_progress["fake_id"] = {"id": "fake_id", "steps": []}
         queue.clear()
         assert queue.snapshot()["in_progress_count"] == 1
@@ -421,7 +474,7 @@ class TestPauseResumeClear:
 
 class TestSnapshotCap:
     def test_completed_history_capped(self, tmp_path):
-        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path)
+        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path, min_interval_s=0)
         for i in range(250):
             queue._finish_item(f"id_{i}", {"id": f"id_{i}", "status": "done", "screenshots": [], "log": [], "error": None})
         assert len(queue.snapshot()["completed"]) == 200
@@ -434,7 +487,7 @@ class TestToolFunctions:
 
     @pytest.mark.asyncio
     async def test_queue_screenshots_tool_adds_and_returns_ids(self, tmp_path):
-        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path)
+        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path, min_interval_s=0)
         queue.pause()  # keep it from actually running for this smoke check
         fn = build_queue_screenshots_tool_fn(queue)
         result = await fn.handler({"items": [[{"action": "navigate", "url": "example.com"}]]})
@@ -444,14 +497,14 @@ class TestToolFunctions:
 
     @pytest.mark.asyncio
     async def test_queue_screenshots_tool_rejects_empty_items(self, tmp_path):
-        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path)
+        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path, min_interval_s=0)
         fn = build_queue_screenshots_tool_fn(queue)
         result = await fn.handler({"items": []})
         assert result.get("is_error") is True
 
     @pytest.mark.asyncio
     async def test_queue_status_tool_reports_progress(self, tmp_path):
-        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path)
+        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path, min_interval_s=0)
         queue.add([[{"action": "navigate", "url": "example.com"}, {"action": "screenshot"}]])
         await drain(queue)
 
@@ -463,7 +516,7 @@ class TestToolFunctions:
 
     @pytest.mark.asyncio
     async def test_queue_clear_tool(self, tmp_path):
-        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path)
+        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path, min_interval_s=0)
         queue.pause()
         queue.add([[{"action": "navigate", "url": "example.com"}]])
         fn = build_queue_clear_tool_fn(queue)
@@ -472,7 +525,7 @@ class TestToolFunctions:
 
     @pytest.mark.asyncio
     async def test_queue_pause_and_resume_tools(self, tmp_path):
-        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path)
+        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path, min_interval_s=0)
         pause_fn = build_queue_pause_tool_fn(queue)
         resume_fn = build_queue_resume_tool_fn(queue)
 
