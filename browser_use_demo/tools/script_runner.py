@@ -9,22 +9,33 @@ fetches (fast, raw HTTP) or navigates (a real rendered page, JS runs), and
 whether it screenshots or not, falls out of which steps you put in it - not
 a flag, and not a different tool for each shape.
 
-Scope (v1): the step vocabulary is the "structured extraction/capture"
-subset of the browser tool's own actions - navigate, screenshot,
-get_page_text, execute_js, wait. NOT included, deliberately:
-- click/type/drag/hover/form_input/key (real interaction) - items that need
-  genuine per-item reasoning or interaction belong in dispatch_subagents,
-  not here; that boundary is drawn on purpose, not a gap.
-- scroll_to - its natural use case (a queue of screenshot locations) is
-  refs/selectors on ONE already-open page, a fundamentally different shape
-  from "one fresh page per item" that every other step here assumes (each
-  item gets its own Page for concurrency safety, so a ref discovered on one
-  item's page means nothing on another's). Needs its own execution model,
-  not a slot in this one - see TODO.md #9's follow-up notes.
-- network_list_types/network_list/network_inspect - #7's capture mechanism
-  is bound to BrowserTool's own instance state (self._network_log); reusing
-  it per-item here needs a small refactor not yet done. A deliberate v1 cut,
-  not an oversight.
+Scope: the step vocabulary is the "structured extraction/capture" subset of
+the browser tool's own actions - navigate, screenshot, get_page_text,
+execute_js, wait, scroll_to, network_list_types, network_list,
+network_inspect. NOT included, deliberately: click/type/drag/hover/
+form_input/key (real interaction) - items that need genuine per-item
+reasoning or interaction belong in dispatch_subagents, not here; that
+boundary is drawn on purpose, not a gap.
+
+scroll_to here is NOT the ref-based browser-tool action (a ref from
+read_page/find is a WeakRef into one page's own JS heap - meaningless on a
+different item's page, and there's no LLM in this loop to call read_page/
+find per item anyway). Instead it takes literal `text` that appears on the
+page - a substring match via page.get_by_text(text, exact=False), same
+mechanism and semantics as sub_browser_queue.py's own scroll_to step -
+resolved fresh against each item's own page, deterministic, no extra LLM/
+API call. Fits the existing "one fresh page per item, steps run in
+sequence on it" model exactly, contrary to the original v1 assumption that
+this needed a different execution model altogether.
+
+network_list_types/network_list/network_inspect reuse the module-level
+capture_network_response/*_text functions factored out of browser.py's own
+network-capture methods - each full-mode item registers its own
+page.on("response", ...) into a fresh per-item log (only when the script
+actually uses one of these steps), so the three query actions read that
+item's own captured traffic. Fast-mode (fetch-only) scripts can't use these
+- there's no live page/response stream to capture there, only a single
+synchronous HTML response already returned in one shot.
 
 Reuses AdaptiveRateLimiter, the rate-limit/transient-status handling, and
 the raw-fetch extraction wrapper from batch_extract.py directly - a script
@@ -34,6 +45,8 @@ through this tool's script shape instead of a separate one.
 
 import asyncio
 import json
+from collections import deque
+from itertools import count
 from pathlib import Path
 from typing import Any, Optional
 
@@ -51,10 +64,16 @@ from .batch_extract import (
 )
 from .browser import (
     BROWSER_TOOL_UTILS_DIR,
+    MAX_NETWORK_LOG_ENTRIES,
     SCREENSHOT_SETTLE_DELAY_S,
     TEXT_READ_SETTLE_DELAY_S,
     BrowserTool,
+    NetworkLogEntry,
+    capture_network_response,
     capture_screenshot,
+    network_inspect_text,
+    network_list_text,
+    network_list_types_text,
     wait_for_page_ready,
 )
 from .file_output import FileOutputTool
@@ -67,7 +86,21 @@ DEFAULT_CONCURRENCY = 5
 MAX_CONCURRENCY_HARD_CAP = 10
 MAX_ATTEMPTS_PER_ITEM = 3
 
-STEP_ACTIONS = frozenset({"navigate", "screenshot", "get_page_text", "execute_js", "wait"})
+STEP_ACTIONS = frozenset(
+    {
+        "navigate",
+        "screenshot",
+        "get_page_text",
+        "execute_js",
+        "wait",
+        "scroll_to",
+        "network_list_types",
+        "network_list",
+        "network_inspect",
+    }
+)
+
+NETWORK_ACTIONS = frozenset({"network_list_types", "network_list", "network_inspect"})
 
 _TEXT_SCRIPT = (BROWSER_TOOL_UTILS_DIR / "browser_text_script.js").read_text()
 
@@ -96,18 +129,28 @@ RUN_SCRIPT_INPUT_SCHEMA: dict = {
             "description": (
                 "The fixed sequence of steps to run once per item, in order - same shape as "
                 "the browser tool's own actions. Each step is an object with `action` (one of: "
-                "navigate, screenshot, get_page_text, execute_js, wait) plus that action's "
-                "usual parameter (text for navigate's URL or execute_js's code, full_page for "
-                "screenshot, duration for wait). Use {{item}} in any string value to substitute "
-                "the current item. If the FIRST step is `navigate`, each item gets its own real "
-                "rendered page (JS runs, client-rendered content is visible) - use this whenever "
-                "you need a screenshot, get_page_text, or JS that depends on client-side "
-                "rendering. If the script does NOT start with `navigate`, every step must be "
-                "execute_js, and each item is fetched via raw HTTP instead (fast, but only sees "
-                "server-rendered HTML - this is exactly batch_extract's mechanism, reached "
-                "through this tool's script shape). NOT supported: click/type/drag/hover/"
-                "form_input/key/scroll_to - items needing real interaction or judgment belong "
-                "in dispatch_subagents instead, not here."
+                "navigate, screenshot, get_page_text, execute_js, wait, scroll_to, "
+                "network_list_types, network_list, network_inspect) plus that action's usual "
+                "parameter (text for navigate's URL, execute_js's code, scroll_to's CSS/"
+                "Playwright-locator selector, network_list's filter, or network_inspect's entry "
+                "id; full_page for screenshot; duration for wait). Use {{item}} in any string "
+                "value to substitute the current item. If the FIRST step is `navigate`, each "
+                "item gets its own real rendered page (JS runs, client-rendered content is "
+                "visible) - required for screenshot, get_page_text, scroll_to, network_* steps, "
+                "or any JS that depends on client-side rendering. scroll_to's `text` is literal "
+                "text that appears on the page (a substring match, not a description - same "
+                "semantics as queue_screenshots' scroll_to) - NOT a browser-tool ref (there's no "
+                "read_page/find step here to produce one; the text match re-resolves "
+                "independently per item's own page instead). network_list_types/network_list/"
+                "network_inspect read that item's own "
+                "captured response traffic since its page was created, same semantics as the "
+                "browser tool's own network actions. If the script does NOT start with "
+                "`navigate`, every step must be execute_js, and each item is fetched via raw "
+                "HTTP instead (fast, but only sees server-rendered HTML - this is exactly "
+                "batch_extract's mechanism, reached through this tool's script shape; scroll_to "
+                "and network_* aren't available in this mode - no live page/response stream to "
+                "act on). NOT supported: click/type/drag/hover/form_input/key - items needing "
+                "real interaction or judgment belong in dispatch_subagents instead, not here."
             ),
             "type": "array",
             "items": {"type": "object"},
@@ -138,13 +181,14 @@ RUN_SCRIPT_INPUT_SCHEMA: dict = {
 
 RUN_SCRIPT_DESCRIPTION = (
     "Run a fixed sequence of browser-tool-shaped steps once per item, without spinning up an "
-    "LLM per item - write the recipe once (navigate/screenshot/get_page_text/execute_js/wait, "
-    "same action names as the browser tool), it replays across all items concurrently and "
-    "hands back one aggregated result. Subsumes batch_extract's shape too: a script with no "
-    "navigate step fetches each item as a URL via raw HTTP instead of rendering it, same as "
-    "batch_extract. Use this whenever a task involves several similar items and the same fixed "
-    "steps would otherwise mean many manual tool calls - not for items that need real per-item "
-    "interaction or judgment, that's still dispatch_subagents."
+    "LLM per item - write the recipe once (navigate/screenshot/get_page_text/execute_js/wait/"
+    "scroll_to/network_list_types/network_list/network_inspect, same action names as the "
+    "browser tool), it replays across all items concurrently and hands back one aggregated "
+    "result. Subsumes batch_extract's shape too: a script with no navigate step fetches each "
+    "item as a URL via raw HTTP instead of rendering it, same as batch_extract. Use this "
+    "whenever a task involves several similar items and the same fixed steps would otherwise "
+    "mean many manual tool calls - not for items that need real per-item interaction or "
+    "judgment, that's still dispatch_subagents."
 )
 
 
@@ -179,9 +223,8 @@ class ScriptRunnerTool:
                 error=(
                     f"Unsupported script action(s): {invalid_actions}. run_script only supports "
                     f"{sorted(STEP_ACTIONS)} - interaction actions (click/type/drag/hover/"
-                    "form_input/key) and scroll_to aren't available here (each item needs its "
-                    "own fresh page, so a ref from one item's page means nothing on another's); "
-                    "use dispatch_subagents for items that need real interaction or judgment."
+                    "form_input/key) aren't available here; use dispatch_subagents for items "
+                    "that need real interaction or judgment."
                 )
             )
 
@@ -201,9 +244,13 @@ class ScriptRunnerTool:
 
         semaphore = asyncio.Semaphore(bounded_concurrency)
         rate_limiter = AdaptiveRateLimiter()
+        needs_network_capture = any(s.get("action") in NETWORK_ACTIONS for s in script)
 
         raw_results = await asyncio.gather(
-            *(self._run_one_item(item, script, fast, semaphore, rate_limiter) for item in items),
+            *(
+                self._run_one_item(item, script, fast, needs_network_capture, semaphore, rate_limiter)
+                for item in items
+            ),
             return_exceptions=True,
         )
 
@@ -239,6 +286,7 @@ class ScriptRunnerTool:
         item: str,
         script: list[dict],
         fast: bool,
+        needs_network_capture: bool,
         semaphore: asyncio.Semaphore,
         rate_limiter: AdaptiveRateLimiter,
     ) -> dict[str, Any]:
@@ -250,7 +298,7 @@ class ScriptRunnerTool:
                     if fast:
                         result = await self._run_fast_item(item, script)
                     else:
-                        result = await self._run_full_item(item, script)
+                        result = await self._run_full_item(item, script, needs_network_capture)
                 except _Retryable as e:
                     await rate_limiter.on_rate_limited(e.retry_after)
                     last_error = "rate limited or transient error"
@@ -298,18 +346,28 @@ class ScriptRunnerTool:
             step_results.append({"action": "execute_js", "output": data})
         return {"item": item, "steps": step_results}
 
-    async def _run_full_item(self, item: str, script: list[dict]) -> dict[str, Any]:
+    async def _run_full_item(
+        self, item: str, script: list[dict], needs_network_capture: bool
+    ) -> dict[str, Any]:
         """First step is navigate: a real, JS-executing page, fresh per item
         (never the coordinator's own self._page - concurrent items must not
         share mutable page state, and the VNC view stays undisturbed)."""
         page = await self.browser_tool._context.new_page()
+        # A fresh log/counter per item, only wired up when the script
+        # actually has a network_* step - this item's page is the only
+        # thing that ever writes to or reads from it, so there's no
+        # cross-item ambiguity the way a browser-tool ref would have.
+        network_log: "deque[NetworkLogEntry]" = deque(maxlen=MAX_NETWORK_LOG_ENTRIES)
+        if needs_network_capture:
+            counter = count(1)
+            page.on("response", lambda response: capture_network_response(response, network_log, counter))
         try:
             step_results = []
             for step in script:
                 action = step.get("action")
                 params = {k: _substitute(v, item) for k, v in step.items() if k != "action"}
                 try:
-                    output = await self._run_full_step(page, action, params)
+                    output = await self._run_full_step(page, action, params, network_log)
                 except _Retryable:
                     raise
                 except Exception as e:
@@ -323,7 +381,7 @@ class ScriptRunnerTool:
         finally:
             await page.close()
 
-    async def _run_full_step(self, page, action: str, params: dict) -> str:
+    async def _run_full_step(self, page, action: str, params: dict, network_log: "deque[NetworkLogEntry]") -> str:
         if action == "navigate":
             url = params.get("text")
             if not url:
@@ -377,6 +435,34 @@ class ScriptRunnerTool:
             duration = float(params.get("duration") or 1.0)
             await asyncio.sleep(duration)
             return f"waited {duration}s"
+
+        if action == "scroll_to":
+            target = params.get("text")
+            if not target:
+                raise ToolError(
+                    "scroll_to step requires 'text' (literal text that appears on the page - "
+                    "a substring match, not a description; same semantics as queue_screenshots' "
+                    "scroll_to target)"
+                )
+            locator = page.get_by_text(target, exact=False).first
+            await locator.scroll_into_view_if_needed(timeout=10000)
+            await asyncio.sleep(0.3)
+            return f"Scrolled to element matching {target!r}"
+
+        if action == "network_list_types":
+            return network_list_types_text(network_log)
+
+        if action == "network_list":
+            return network_list_text(network_log, params.get("text"))
+
+        if action == "network_inspect":
+            entry_id = params.get("text")
+            if not entry_id:
+                raise ToolError(
+                    "network_inspect step requires 'text' (the entry id from a preceding "
+                    "network_list step's output)"
+                )
+            return network_inspect_text(network_log, entry_id)
 
         raise ToolError(f"Unsupported script step action: {action!r}")
 
