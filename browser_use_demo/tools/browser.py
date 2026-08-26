@@ -623,21 +623,8 @@ class BrowserTool:
 
     async def _ensure_browser(self) -> None:
         """Launch browser and ensure page is ready."""
-        # NOTE: We intentionally DON'T reset the browser if the event loop changes
-        # The browser should persist across conversation turns
-        # Commenting out event loop check that was causing browser resets:
-        # try:
-        #     current_loop = asyncio.get_running_loop()
-        #     if self._initialized and hasattr(self, "_event_loop"):
-        #         if self._event_loop != current_loop:
-        #             self._initialized = False
-        #             self._browser = None
-        #             self._context = None
-        #             self._page = None
-        #             self._playwright = None
-        # except RuntimeError:
-        #     pass
-
+        # Intentionally does NOT reset the browser if the event loop changes -
+        # it should persist across conversation turns.
         if self._initialized:
             print(
                 f"[Browser] Reusing existing browser instance",

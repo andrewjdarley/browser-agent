@@ -21,7 +21,6 @@ uncertainty explicitly instead of presenting an unchecked claim as verified.
 import json
 import re
 from typing import Any
-from uuid import uuid4
 
 from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient, TextBlock
 from claude_agent_sdk import tool as sdk_tool
@@ -114,7 +113,6 @@ class VerifyFindingTool:
         self._uses += 1
         uses_remaining = MAX_VERIFICATIONS_PER_SESSION - self._uses
 
-        verification_id = uuid4().hex
         browser_tool = BrowserTool(run_dir=self.run_dir)
         file_output_tool = FileOutputTool(run_dir=self.run_dir)
         try:

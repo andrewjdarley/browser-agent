@@ -47,7 +47,6 @@ import asyncio
 import json
 from collections import deque
 from itertools import count
-from pathlib import Path
 from typing import Any, Optional
 
 from claude_agent_sdk import tool as sdk_tool

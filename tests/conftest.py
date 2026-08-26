@@ -71,6 +71,9 @@ def sample_tool_result():
             output="With screenshot",
             base64_image="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
         ),
+        "image_only": ToolResult(
+            base64_image="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+        ),
         "empty": ToolResult(),
         "all_fields": ToolResult(
             output="Output text",

@@ -88,6 +88,30 @@ class TestRenderMethod:
         mock_streamlit["markdown"].assert_called_with("With screenshot")
         mock_streamlit["image"].assert_not_called()
 
+    def test_render_tool_result_image_only_skipped_when_hidden(
+        self, mock_streamlit, sample_tool_result
+    ):
+        """Regression test: a ToolResult with only a screenshot (no output/
+        error text) must be skipped entirely when hide_screenshots is True -
+        _should_skip_message previously used hasattr(message, "error")/
+        hasattr(message, "output"), which are always True on a ToolResult
+        (they're always-present dataclass fields), so this never actually
+        skipped anything."""
+        mock_streamlit["session_state"].hide_screenshots = True
+        renderer = MessageRenderer(mock_streamlit["session_state"])
+        renderer.render(Sender.TOOL, sample_tool_result["image_only"])
+
+        mock_streamlit["chat_message"].assert_not_called()
+
+    def test_render_tool_result_image_only_shown_when_not_hidden(
+        self, mock_streamlit, sample_tool_result
+    ):
+        mock_streamlit["session_state"].hide_screenshots = False
+        renderer = MessageRenderer(mock_streamlit["session_state"])
+        renderer.render(Sender.TOOL, sample_tool_result["image_only"])
+
+        assert mock_streamlit["image"].called
+
     def test_render_tool_result_with_appended_dom_context_shows_leading_text(
         self, mock_streamlit
     ):

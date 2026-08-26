@@ -120,7 +120,7 @@ class MessageRenderer:
         # Skip tool results that only have screenshots when screenshots are hidden
         is_tool_result = not isinstance(message, str | dict)
         if is_tool_result and self.session_state.hide_screenshots:
-            return not hasattr(message, "error") and not hasattr(message, "output")
+            return not message.error and not message.output
 
         return False
 
