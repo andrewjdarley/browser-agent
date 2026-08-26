@@ -33,27 +33,19 @@ from browser_use_demo.text_utils import clean_text_extraction_markers
 from browser_use_demo.tools.sub_browser_queue import SubBrowserQueue
 
 # Process-wide (NOT st.session_state - a plain module global, shared across
-# every session Streamlit's one server process handles), holding whichever
-# session is currently the "main" one. Exists so the standalone
-# ?view=queue page - a separate browser tab/iframe, and therefore a
-# genuinely different session_state instance AND a different Streamlit
-# session thread, with no access to the main session's own state - can
-# still find and render the SAME SubBrowserQueue's live activity.
-# Deliberately single-slot, not keyed by run_id: this app is a single-user,
-# one-session-at-a-time demo (see image/static_content/index.html, which
-# embeds this app's own /?view=queue as its third pane specifically to read
-# this), so there's no real multi-session case to key against, and adding
-# one would need the two iframes to coordinate on a run_id neither knows
-# before the main session has actually started.
+# every session Streamlit's one server process handles). The standalone
+# /?view=queue page is a separate browser tab/iframe with its own
+# session_state and its own Streamlit session thread, with no access to the
+# main session's state - this is how it finds the main session's
+# SubBrowserQueue and its live activity. Single-slot, not keyed by run_id:
+# this is a single-user, one-session-at-a-time demo.
 #
-# "previews" holds the last-computed live-preview images (see
-# render_queue_heartbeat), not just the queue object itself, because
-# capturing them requires awaiting Playwright calls on Page objects bound
-# to the MAIN session's own asyncio event loop - asyncio loops aren't
-# thread-safe to drive from a different thread (which the ?view=queue
-# session runs on), so that capture can only safely happen on the main
-# session's own periodic tick. The queue-only view is a pure reader of
-# whatever was last published here - never runs that capture itself.
+# "previews" holds the last-computed live-preview images, not just the
+# queue object, because capturing them means awaiting Playwright calls on
+# Page objects bound to the MAIN session's own asyncio event loop - loops
+# aren't thread-safe to drive cross-thread, so capture can only safely
+# happen on the main session's own periodic tick (render_queue_heartbeat).
+# The queue-only view is a pure reader of whatever was last published here.
 _ACTIVE_SESSION = {"queue": None, "previews": {}}
 
 STREAMLIT_STYLE = """
@@ -135,9 +127,10 @@ def setup_state():
             browser_tool=st.session_state.browser_tool,
             run_logger=st.session_state.run_logger,
         ),
-        # Same reasoning as guardrail_policy - one instance for the session,
-        # its max_fanout flipped in place from the sidebar. Must also stay
-        # after browser_tool in this dict.
+        # Same reasoning as guardrail_policy - one instance for the session.
+        # Must also stay after browser_tool in this dict. max_fanout/
+        # min_interval_s are set here as defaults only - the agent can
+        # override both per-call via queue_screenshots' own args.
         "sub_browser_queue": lambda: SubBrowserQueue(
             browser_tool=st.session_state.browser_tool,
             run_dir=run_dir,
@@ -471,7 +464,7 @@ def render_queue_heartbeat():
        gets published here, never capture previews itself.
 
     Renders a one-line status + link, not the full grid - the dedicated
-    /?view=queue page (see index.html's third pane) is where that lives.
+    /?view=queue page is where that lives.
     """
     queue = st.session_state.sub_browser_queue
     _ACTIVE_SESSION["queue"] = queue
@@ -524,12 +517,11 @@ def _render_sub_browser_panel_fragment():
 
 
 def render_queue_only_view():
-    """The standalone page served at /?view=queue - index.html's third pane
-    points here (see image/static_content/index.html) so the live grid gets
-    its own dedicated column instead of sharing space with the chat. No
-    sidebar, no chat, no setup_state() (this session never needs its own
-    BrowserTool/agent client - it's a read-only view onto the main
-    session's queue, via _ACTIVE_SESSION)."""
+    """The standalone page served at /?view=queue, for viewing the live
+    grid on its own instead of sharing space with the chat. No sidebar, no
+    chat, no setup_state() - this session never needs its own BrowserTool/
+    agent client, it's a read-only view onto the main session's queue via
+    _ACTIVE_SESSION."""
     st.set_page_config(page_title="Sub-browser Queue", page_icon="🧪", layout="wide")
     st.markdown(STREAMLIT_STYLE, unsafe_allow_html=True)
     st.title("🧪 Sub-browser Queue")
@@ -809,13 +801,9 @@ def main():
         )
         st.session_state.guardrail_policy.mode = st.session_state.restriction_mode
 
-        # No sidebar control for the sub-browser queue's fanout/pacing - it
-        # never had anything worth showing here (the live grid lives at
-        # /?view=queue, embedded as index.html's third pane - see
-        # render_queue_only_view/render_sub_browser_panel), and max_fanout/
-        # min_interval_s are now agent-settable directly via queue_screenshots'
-        # own arguments (see tools/sub_browser_queue.py) instead of a human
-        # dialing in a fixed value up front.
+        # No sidebar control for the sub-browser queue's fanout/pacing -
+        # max_fanout/min_interval_s are agent-settable directly via
+        # queue_screenshots' own arguments (tools/sub_browser_queue.py).
 
         # Conversation Management Section
         st.divider()
