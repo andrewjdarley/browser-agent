@@ -1,44 +1,35 @@
 """A background screenshot-capture queue over the coordinator's own browser
-context - "sub-browser sessions" in the sense of independent Pages (own
-navigation/viewport, doesn't touch the coordinator's self._page), not
-independent Browser processes. Deliberately reuses browser_tool._context
-(same pattern batch_extract.py/script_runner.py already established) rather
-than launching a separate browser: cheaper, and inherits whatever
-cookies/login the visible session already has.
+context - "sub-browser sessions" meaning independent Pages (own navigation/
+viewport, never touches the coordinator's self._page), not independent
+Browser processes. Reuses browser_tool._context rather than launching a
+separate browser (same pattern as batch_extract.py/script_runner.py):
+cheaper, and inherits whatever cookies/login the visible session already has.
 
-Shape: the agent drops instruction sequences ("visit X, scroll to Y,
-screenshot" / "visit Z, full-page screenshot") into the queue via
-queue_screenshots and gets item ids back immediately - it does not wait for
-them. Items are picked up and run concurrently, up to max_fanout at a time,
-paced no faster than min_interval_s apart - a real batch against several
-distinct news sites once ran unthrottled and got one of them to start
-rate-limiting the whole run, which max_fanout alone doesn't prevent (it caps
-how many run AT ONCE, not how fast new ones start as slots free up). Each
-item runs against its own fresh Page. Results (screenshots + a log) collect
-as items finish, queryable via queue_status.
+The agent drops instruction sequences ("visit X, scroll to Y, screenshot")
+into the queue via queue_screenshots and gets item ids back immediately -
+it does not wait for them. Items run concurrently up to max_fanout at a
+time, paced no faster than min_interval_s apart (see DEFAULT_MIN_INTERVAL_S
+below for why pacing exists separately from the concurrency cap). Each item
+gets its own fresh Page; results (screenshots + a log) collect as items
+finish, queryable via queue_status.
 
-The human-facing side prioritizes watching the fanout happen over reviewing
-it afterward - the coordinator's own browser runs headful (see browser.py's
-_ensure_browser, headless=False) precisely so a human can watch it live via
-VNC, but VNC only shows whichever tab is focused, so it can't show several
-concurrent sub-browser pages at once. capture_live_previews grabs a fresh,
-ephemeral (never saved to disk) screenshot of every currently in-progress
-item's page on every UI tick instead - see streamlit.py's
-render_sub_browser_panel, which renders these as a live grid.
+VNC only shows whichever tab is focused, so it can't show several
+concurrent sub-browser pages at once (the coordinator's browser runs
+headful specifically so a human can watch it live - see browser.py's
+_ensure_browser). capture_live_previews grabs a fresh, ephemeral (never
+saved to disk) screenshot of every in-progress item's page on each UI tick
+instead - see streamlit.py's render_sub_browser_panel, which renders these
+as a live grid.
 
 Concurrency model: everything runs on ONE asyncio event loop - the same one
-Streamlit's session already drives (st.session_state.event_loop) - rather
-than a separate thread with its own browser. A second thread would need its
-own separate Playwright browser (Playwright's async Page/BrowserContext
-objects are bound to the event loop that created them - they can't safely be
-driven from a different thread), which would mean not sharing the
-coordinator's session and paying for a second browser process. Instead,
-_kick_off_more schedules item coroutines onto the current loop via
-asyncio.create_task - real concurrency, since Streamlit's own agent-turn
-processing already keeps that loop spinning through many await points - and
-the sidebar panel's periodic st.fragment tick (see streamlit.py) calls
-queue.pump() on every refresh so scheduled tasks keep advancing even when no
-chat turn is active, not just while the agent happens to be mid-turn.
+Streamlit's session already drives - rather than a separate thread with its
+own browser, since Playwright's Page/BrowserContext objects are bound to
+the event loop that created them and can't safely be driven cross-thread.
+_kick_off_more schedules item coroutines via asyncio.create_task; the
+sidebar panel's periodic st.fragment tick calls queue.pump() on every
+refresh so scheduled tasks keep advancing even when no chat turn is active
+(a bare asyncio.create_task only schedules work, it doesn't run it - see
+pump_async).
 """
 
 import asyncio
@@ -58,13 +49,10 @@ STEP_ACTIONS = frozenset({"navigate", "scroll_to", "screenshot"})
 MAX_COMPLETED_HISTORY = 200
 MAX_STATUS_RESULTS = 30
 
-# A real run queued 4 items against 4 different news sites with max_fanout's
-# default (8) providing no pacing at all beyond the concurrency cap - fine
-# for a handful of distinct domains, but a large batch hitting the SAME
-# domain (the tool's actual target use case, see its description) at that
-# same unthrottled pace got the target site to start rate-limiting the
-# whole run. This default is a safety baseline, not just an opt-in knob -
-# see min_interval_s below.
+# A safety baseline, not just an opt-in knob: max_fanout alone only caps how
+# many items run AT ONCE, not how fast new ones start as slots free up, so
+# an unthrottled batch hitting one domain repeatedly can still trip its
+# rate limiting even with a modest fanout.
 DEFAULT_MIN_INTERVAL_S = 0.5
 
 _SCREENSHOT_FILENAME_RE = re.compile(r"Screenshot saved as (\S+)")

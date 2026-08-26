@@ -89,8 +89,8 @@ Before presenting a finding as fact, check whether it's ALL THREE of: specific (
 def _combined_pre_tool_use_hook(run_logger: RunLogger, guardrail_policy: GuardrailPolicy):
     """One PreToolUse hook function that does both jobs in a fixed order:
     always log the call (run_logger), then let the guardrail decide whether
-    it's allowed - see the "PreToolUse" hooks= comment in build_options for
-    why this is one matcher instead of two."""
+    it's allowed. One matcher, not two - see build_options' hooks= dict for
+    why."""
 
     async def _hook(input_data: dict, tool_use_id, context) -> dict:
         await run_logger.on_pre_tool_use(input_data, tool_use_id, context)
@@ -179,17 +179,14 @@ def build_options(
         model=model,
         system_prompt=system_prompt,
         mcp_servers={"browser_use": server},
-        # `tools=[]` disables the SDK's full built-in Claude Code toolset
-        # (Bash, Read, Write, Edit, Glob, Grep, WebSearch, WebFetch, ...) -
-        # `allowed_tools` alone does NOT do this, it only controls which
-        # tools skip the permission prompt, not which tools exist (see the
-        # SDK's own ClaudeAgentOptions.tools docstring). Without this, a real
-        # run showed the model reaching for Bash/Read directly (curl-ing a
-        # URL, cat-ing a saved tool-result file) when a browser action hit
-        # friction - a much bigger capability surface than "browser
-        # automation" was ever meant to have, and one that bypasses every
-        # safeguard built around the MCP browser tools (rate limiting,
-        # verify_finding, DOM-diff, run_logger's hooks).
+        # `tools=[]` disables the SDK's built-in Claude Code toolset (Bash,
+        # Read, Write, Edit, Glob, Grep, WebSearch, WebFetch, ...) -
+        # `allowed_tools` alone only controls which tools skip the
+        # permission prompt, not which tools exist (see ClaudeAgentOptions.
+        # tools' own docstring). Without this, the model can reach for Bash/
+        # Read directly instead of the MCP browser tools, bypassing every
+        # safeguard built around them (guardrails, verify_finding, DOM-diff,
+        # run_logger's hooks).
         tools=[],
         allowed_tools=[
             "mcp__browser_use__browser",

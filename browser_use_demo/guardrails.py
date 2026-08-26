@@ -1,25 +1,18 @@
-"""Deterministic guardrail checks for elevated-credential agent runs.
+"""Deterministic guardrail checks for elevated-credential agent runs: an
+operator gives the agent their own full-access credentials, and needs a way
+to keep it from doing something destructive/out-of-scope with that access.
 
-The problem this addresses: an operator gives the agent their own full-access
-credentials so it can act as them, and needs some way to keep it from doing
-something destructive/out-of-scope with that access. Two mechanisms were
-deliberately ruled out - see TODO.md's write-up for the reasoning:
-
-- A hand-built policy taxonomy (per-site/per-domain rules) - expensive to
-  build up front, and still imperfect once built.
-- A separate LLM classifier gating every action - nondeterministic, costs a
-  real model call per gated action, and "the classifier said it was fine" is
-  a weak answer for an audit-focused product compared to "this violated an
-  explicit rule" or "a human signed off."
-
-What's here instead: a small, fixed set of regex/keyword checks over the
-*structured* tool call the model already produced (the action name and its
-params - and, for click/form_input, the last-known DOM snapshot's text for
-the targeted ref, so the check can see an element's accessible name/role
-without re-deriving it). Cheap, deterministic, fully inspectable - a blocked
-call always has a one-line "this exact pattern matched" answer. Not meant to
-catch everything; meant to catch the tail, on the assumption (explicitly the
-operator's own premise) that the agent is otherwise reasonably aligned.
+Deliberately not a hand-built policy taxonomy (expensive to build, still
+imperfect) or an LLM classifier gating every action (nondeterministic, a
+real model call per gated action, and a weaker audit answer than "this
+violated an explicit rule"). Instead: a small, fixed set of regex/keyword
+checks over the *structured* tool call itself (the action name and its
+params - plus, for click/form_input, the last-known DOM snapshot's text for
+the targeted ref, so a check can see an element's accessible name/role
+without re-deriving it). Cheap, deterministic, fully inspectable - a
+blocked call always has a one-line "this exact pattern matched" answer.
+Not meant to catch everything; meant to catch the tail, on the assumption
+(the operator's own premise) that the agent is otherwise reasonably aligned.
 
 Wired in as a PreToolUse hook via GuardrailPolicy, constructed once per
 Streamlit session and passed into loop.build_options. Mutating `.mode` in

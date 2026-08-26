@@ -7,11 +7,9 @@ import base64
 import io
 import json
 import os
-import time
 import traceback
 import zipfile
 from datetime import datetime
-from pathlib import PosixPath
 
 import streamlit as st
 from claude_agent_sdk import (
@@ -32,34 +30,22 @@ from browser_use_demo.model_config import MAIN_MODEL
 from browser_use_demo.run_context import get_run_dir, new_run_id
 from browser_use_demo.run_logger import RunLogger
 from browser_use_demo.text_utils import clean_text_extraction_markers
-from browser_use_demo.tools import ToolResult
 from browser_use_demo.tools.sub_browser_queue import SubBrowserQueue
 
-CONFIG_DIR = PosixPath("~/.anthropic").expanduser()
-API_KEY_FILE = CONFIG_DIR / "api_key"
-
 # Process-wide (NOT st.session_state - a plain module global, shared across
-# every session Streamlit's one server process handles), holding whichever
-# session is currently the "main" one. Exists so the standalone
-# ?view=queue page - a separate browser tab/iframe, and therefore a
-# genuinely different session_state instance AND a different Streamlit
-# session thread, with no access to the main session's own state - can
-# still find and render the SAME SubBrowserQueue's live activity.
-# Deliberately single-slot, not keyed by run_id: this app is a single-user,
-# one-session-at-a-time demo (see image/static_content/index.html, which
-# embeds this app's own /?view=queue as its third pane specifically to read
-# this), so there's no real multi-session case to key against, and adding
-# one would need the two iframes to coordinate on a run_id neither knows
-# before the main session has actually started.
+# every session Streamlit's one server process handles). The standalone
+# /?view=queue page is a separate browser tab/iframe with its own
+# session_state and its own Streamlit session thread, with no access to the
+# main session's state - this is how it finds the main session's
+# SubBrowserQueue and its live activity. Single-slot, not keyed by run_id:
+# this is a single-user, one-session-at-a-time demo.
 #
-# "previews" holds the last-computed live-preview images (see
-# render_queue_heartbeat), not just the queue object itself, because
-# capturing them requires awaiting Playwright calls on Page objects bound
-# to the MAIN session's own asyncio event loop - asyncio loops aren't
-# thread-safe to drive from a different thread (which the ?view=queue
-# session runs on), so that capture can only safely happen on the main
-# session's own periodic tick. The queue-only view is a pure reader of
-# whatever was last published here - never runs that capture itself.
+# "previews" holds the last-computed live-preview images, not just the
+# queue object, because capturing them means awaiting Playwright calls on
+# Page objects bound to the MAIN session's own asyncio event loop - loops
+# aren't thread-safe to drive cross-thread, so capture can only safely
+# happen on the main session's own periodic tick (render_queue_heartbeat).
+# The queue-only view is a pure reader of whatever was last published here.
 _ACTIVE_SESSION = {"queue": None, "previews": {}}
 
 STREAMLIT_STYLE = """
@@ -111,7 +97,6 @@ def setup_state():
         "messages": [],
         "system_prompt": "",
         "hide_screenshots": False,
-        "rendered_message_count": 0,  # Track rendered messages to avoid re-rendering
         "last_error": None,  # Store last error message to display persistently
         "restriction_mode": "none",  # Guardrail toggle - see the sidebar widget below
         # API Configuration
@@ -122,7 +107,6 @@ def setup_state():
         "tools": {},
         "event_loop": None,  # Persistent event loop for async operations
         "chat_disabled": False,  # Simple flag to disable chat input
-        "active_messages": [],  # Store messages for current interaction
         "active_response_container": None,  # Container reference for streaming responses
         "agent_client": None,  # Persistent ClaudeSDKClient, connected lazily on first message
         "agent_client_config": None,  # Config the client was built with, to detect sidebar changes
@@ -143,9 +127,10 @@ def setup_state():
             browser_tool=st.session_state.browser_tool,
             run_logger=st.session_state.run_logger,
         ),
-        # Same reasoning as guardrail_policy - one instance for the session,
-        # its max_fanout flipped in place from the sidebar. Must also stay
-        # after browser_tool in this dict.
+        # Same reasoning as guardrail_policy - one instance for the session.
+        # Must also stay after browser_tool in this dict. max_fanout/
+        # min_interval_s are set here as defaults only - the agent can
+        # override both per-call via queue_screenshots' own args.
         "sub_browser_queue": lambda: SubBrowserQueue(
             browser_tool=st.session_state.browser_tool,
             run_dir=run_dir,
@@ -204,7 +189,7 @@ Image references in the transcript point to files in the images/ directory.
             zip_file.writestr("README.txt", readme_content)
         else:
             # Just create transcript without images
-            transcript_json = format_transcript_for_download(messages, False)
+            transcript_json = format_transcript_for_download(messages)
 
             readme_content = f"""Browser Use Demo - Conversation Transcript
 Generated: {datetime.now().isoformat()}
@@ -341,53 +326,34 @@ def extract_images_from_messages(messages: list) -> tuple:
     return json.dumps(transcript, indent=2, ensure_ascii=False), extractor.image_files
 
 
-def format_transcript_for_download(messages: list, include_images: bool = False) -> str:
-    """Format conversation messages into a readable transcript.
-
-    Args:
-        messages: List of message dictionaries from session state
-        include_images: Whether to include base64 image data in the transcript
-
-    Returns:
-        Formatted JSON string of the conversation
-    """
+def format_transcript_for_download(messages: list) -> str:
+    """Format conversation messages into a text-only JSON transcript (no
+    image data - see create_transcript_zip for the "include images" case,
+    which uses ImageExtractor to write them as separate files instead)."""
     transcript = {
         "timestamp": datetime.now().isoformat(),
         "format_version": "1.0",
-        "includes_images": include_images,
-        "conversation": []
+        "conversation": [
+            {
+                "role": message.get("role"),
+                "timestamp": datetime.now().isoformat(),
+                "content": _format_message_content(message.get("content", "")),
+            }
+            for message in messages
+        ],
     }
-
-    for message in messages:
-        cleaned_message = {
-            "role": message.get("role"),
-            "timestamp": datetime.now().isoformat(),
-            "content": _format_message_content(message.get("content", ""), include_images)
-        }
-        transcript["conversation"].append(cleaned_message)
-
     return json.dumps(transcript, indent=2, ensure_ascii=False)
 
 
-def _format_text_content(item: dict, include_images: bool = False) -> dict:
-    """Format a text content block."""
-    return {
-        "type": "text",
-        "text": clean_text_extraction_markers(item.get("text", ""))
-    }
+def _format_text_content(item: dict) -> dict:
+    return {"type": "text", "text": clean_text_extraction_markers(item.get("text", ""))}
 
 
-def _format_tool_use_content(item: dict, include_images: bool = False) -> dict:
-    """Format a tool use content block."""
-    return {
-        "type": "tool_use",
-        "name": item.get("name", ""),
-        "input": item.get("input", {})
-    }
+def _format_tool_use_content(item: dict) -> dict:
+    return {"type": "tool_use", "name": item.get("name", ""), "input": item.get("input", {})}
 
 
-def _format_tool_result_content(item: dict, include_images: bool = False) -> dict:
-    """Format a tool result content block."""
+def _format_tool_result_content(item: dict) -> dict:
     tool_content = []
     for content_item in item.get("content", []):
         if isinstance(content_item, dict):
@@ -396,16 +362,7 @@ def _format_tool_result_content(item: dict, include_images: bool = False) -> dic
                 text = clean_text_extraction_markers(content_item.get("text", ""))
                 tool_content.append({"type": "text", "text": text})
             elif content_type == "image":
-                if include_images:
-                    source = content_item.get("source", {})
-                    if source.get("type") == "base64":
-                        tool_content.append({
-                            "type": "image",
-                            "media_type": source.get("media_type", "image/png"),
-                            "base64_data": source.get("data", "")
-                        })
-                else:
-                    tool_content.append({"type": "image", "note": "Screenshot taken"})
+                tool_content.append({"type": "image", "note": "Screenshot taken"})
 
     return {
         "type": "tool_result",
@@ -414,25 +371,14 @@ def _format_tool_result_content(item: dict, include_images: bool = False) -> dic
     }
 
 
-def _format_image_content(item: dict, include_images: bool = False) -> dict:
-    """Format an image content block."""
-    if include_images:
-        source = item.get("source", {})
-        if source.get("type") == "base64":
-            return {
-                "type": "image",
-                "media_type": source.get("media_type", "image/png"),
-                "base64_data": source.get("data", "")
-            }
+def _format_image_content(item: dict) -> dict:
     return {"type": "image", "note": "Image/Screenshot included"}
 
 
-def _format_default_content(item: dict, include_images: bool = False) -> dict:
-    """Format unknown content types - fallback handler."""
+def _format_default_content(item: dict) -> dict:
     return item
 
 
-# Strategy pattern: Map content types to their formatting functions
 CONTENT_FORMATTERS = {
     "text": _format_text_content,
     "tool_use": _format_tool_use_content,
@@ -441,28 +387,19 @@ CONTENT_FORMATTERS = {
 }
 
 
-def _format_content_item(item, include_images: bool = False):
-    """Format a single content item using the appropriate formatter.
-
-    Uses the Strategy pattern to dispatch to the correct formatter based on content type.
-    """
+def _format_content_item(item):
+    """Dispatch a single content item to the formatter for its type."""
     if not isinstance(item, dict):
         return str(item)
-
-    content_type = item.get("type")
-    formatter = CONTENT_FORMATTERS.get(content_type, _format_default_content)
-    return formatter(item, include_images)
+    formatter = CONTENT_FORMATTERS.get(item.get("type"), _format_default_content)
+    return formatter(item)
 
 
-def _format_message_content(content, include_images: bool = False):
-    """Format message content based on its type.
-
-    This is the main entry point that handles different content structures.
-    """
+def _format_message_content(content):
     if isinstance(content, str):
         return content
     elif isinstance(content, list):
-        return [_format_content_item(item, include_images) for item in content]
+        return [_format_content_item(item) for item in content]
     else:
         return str(content)
 
@@ -527,7 +464,7 @@ def render_queue_heartbeat():
        gets published here, never capture previews itself.
 
     Renders a one-line status + link, not the full grid - the dedicated
-    /?view=queue page (see index.html's third pane) is where that lives.
+    /?view=queue page is where that lives.
     """
     queue = st.session_state.sub_browser_queue
     _ACTIVE_SESSION["queue"] = queue
@@ -580,12 +517,11 @@ def _render_sub_browser_panel_fragment():
 
 
 def render_queue_only_view():
-    """The standalone page served at /?view=queue - index.html's third pane
-    points here (see image/static_content/index.html) so the live grid gets
-    its own dedicated column instead of sharing space with the chat. No
-    sidebar, no chat, no setup_state() (this session never needs its own
-    BrowserTool/agent client - it's a read-only view onto the main
-    session's queue, via _ACTIVE_SESSION)."""
+    """The standalone page served at /?view=queue, for viewing the live
+    grid on its own instead of sharing space with the chat. No sidebar, no
+    chat, no setup_state() - this session never needs its own BrowserTool/
+    agent client, it's a read-only view onto the main session's queue via
+    _ACTIVE_SESSION."""
     st.set_page_config(page_title="Sub-browser Queue", page_icon="🧪", layout="wide")
     st.markdown(STREAMLIT_STYLE, unsafe_allow_html=True)
     st.title("🧪 Sub-browser Queue")
@@ -691,9 +627,6 @@ async def run_agent(user_input: str):
         # Display user message in active container
         with st.session_state.active_response_container:
             renderer.render(Sender.USER, user_input)
-
-        # Clear active messages for new interaction
-        st.session_state.active_messages = []
 
         client = await get_or_create_agent_client()
         await client.query(user_input)
@@ -868,13 +801,9 @@ def main():
         )
         st.session_state.guardrail_policy.mode = st.session_state.restriction_mode
 
-        # No sidebar control for the sub-browser queue's fanout/pacing - it
-        # never had anything worth showing here (the live grid lives at
-        # /?view=queue, embedded as index.html's third pane - see
-        # render_queue_only_view/render_sub_browser_panel), and max_fanout/
-        # min_interval_s are now agent-settable directly via queue_screenshots'
-        # own arguments (see tools/sub_browser_queue.py) instead of a human
-        # dialing in a fixed value up front.
+        # No sidebar control for the sub-browser queue's fanout/pacing -
+        # max_fanout/min_interval_s are agent-settable directly via
+        # queue_screenshots' own arguments (tools/sub_browser_queue.py).
 
         # Conversation Management Section
         st.divider()
@@ -916,10 +845,7 @@ def main():
                 )
             else:
                 # Generate JSON only
-                transcript_json = format_transcript_for_download(
-                    st.session_state.messages,
-                    include_images=False
-                )
+                transcript_json = format_transcript_for_download(st.session_state.messages)
 
                 # Show file size
                 file_size_kb = len(transcript_json.encode('utf-8')) / 1024
@@ -942,15 +868,10 @@ def main():
 
         # Clear conversation
         if st.button("🗑️ Clear Conversation", type="secondary", use_container_width=True):
-            if st.session_state.event_loop is None or st.session_state.event_loop.is_closed():
-                st.session_state.event_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(st.session_state.event_loop)
-            st.session_state.event_loop.run_until_complete(disconnect_agent_client())
+            get_or_create_event_loop().run_until_complete(disconnect_agent_client())
 
             st.session_state.messages = []
             st.session_state.tools = {}
-            st.session_state.rendered_message_count = 0
-            st.session_state.active_messages = []
             st.session_state.chat_disabled = False
             st.rerun()
 
@@ -960,10 +881,7 @@ def main():
                 if st.session_state.browser_tool._page:
                     await st.session_state.browser_tool._page.goto("about:blank")
 
-            if st.session_state.event_loop is None or st.session_state.event_loop.is_closed():
-                st.session_state.event_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(st.session_state.event_loop)
-            st.session_state.event_loop.run_until_complete(reset_browser())
+            get_or_create_event_loop().run_until_complete(reset_browser())
             st.rerun()
 
         st.divider()

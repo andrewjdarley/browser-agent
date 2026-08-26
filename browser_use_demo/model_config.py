@@ -2,12 +2,10 @@
 
 The coordinator's own model is the one visible, user-facing choice (the
 Streamlit sidebar dropdown - see streamlit.py's BROWSER_COMPATIBLE_MODELS).
-Everything below is about the OTHER models running behind the scenes, which
-used to either silently inherit the coordinator's model with no way to
-change that, or (find's case) be hardcoded to a specific model string with
-no way to change it at all short of editing code. All of these are
-overridable via environment variables (picked up from .env - see
-docker-compose.yml's env_file) without touching code.
+Everything below is about the OTHER models running behind the scenes -
+each independently overridable via environment variables (picked up from
+.env - see docker-compose.yml's env_file), defaulting to inheriting the
+coordinator's own model where noted.
 """
 
 import os

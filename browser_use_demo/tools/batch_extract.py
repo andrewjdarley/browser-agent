@@ -19,7 +19,6 @@ navigation is still the right tool.
 
 import asyncio
 import json
-from pathlib import Path
 from typing import Any, Optional
 
 from claude_agent_sdk import tool as sdk_tool

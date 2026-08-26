@@ -25,10 +25,6 @@ from ..model_config import FIND_MODEL
 from .base import ToolError, ToolResult
 from .coordinate_scaling import CoordinateScaler
 
-# Simple logging for debugging - removed, using print directly
-
-
-# Custom browser tool input schema
 BROWSER_TOOL_INPUT_SCHEMA: dict[str, Any] = {
     "properties": {
         "action": {
@@ -133,45 +129,46 @@ Key actions:
 OUTPUT_DIR = Path("/tmp/outputs")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def _debug(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+def _warn_if_out_of_viewport(x: int, y: int, viewport: Optional[dict]) -> None:
+    if not viewport or (0 <= x <= viewport["width"] and 0 <= y <= viewport["height"]):
+        return
+    _debug(f"[Click] WARNING: Coordinates ({x}, {y}) are outside viewport ({viewport['width']}x{viewport['height']})")
+
+
+def _estimate_tokens(content_length: int) -> int:
+    """Rough ~3.5 chars/token approximation for English text - use
+    client.beta.messages.count_tokens for exact counts."""
+    return int(content_length / 3.5)
+
+
+def _wrap_extraction(marker: str, summary: str, full_content: str) -> ToolResult:
+    """Wrap extracted content with a `__{marker}__`/`__FULL_CONTENT__`
+    delimited summary - the UI shows the summary, the model gets it all."""
+    return ToolResult(output=f"__{marker}__\n{summary}\n__FULL_CONTENT__\n{full_content}", error=None)
+
 # Roughly 14 stacked 1080p viewports. Above this, full-page capture is more
 # likely to hang or produce a misleadingly huge image (e.g. infinite-scroll
 # feeds) than to be useful.
 MAX_FULL_PAGE_HEIGHT_PX = 15000
 FULL_PAGE_SCREENSHOT_TIMEOUT_S = 15
 
-# A full_page capture that ends up bigger than this (raw PNG bytes) doesn't
-# get sent whole - a huge image isn't more useful to the model than a
-# reasonably-sized one anyway, and cramming it through the IPC channel to
-# the CLI subprocess risks exceeding its message buffer and killing the
-# whole session, not just this one tool call. Retry with a clipped capture
-# of just the top of the page instead - for most real pages (docs, PR pages,
-# articles) the header/summary/most relevant content is there, and anything
-# further down is what scroll/get_page_text are for.
+# A full_page capture bigger than this (raw PNG bytes) risks exceeding the
+# CLI subprocess's IPC message buffer and killing the whole session, not
+# just this tool call - retry with a clipped top-of-page capture instead.
 MAX_SCREENSHOT_RAW_BYTES = 3 * 1024 * 1024  # 3 MiB raw PNG (~4 MiB base64)
 FULL_PAGE_FALLBACK_VIEWPORTS = 4  # height of the top-of-page retry capture
 
-# document.readyState hitting "complete" means the HTML/JS has loaded - it says
-# nothing about whether a client-rendered page (React/Next.js apps, lazy images,
-# fade-in animations) has actually painted its content yet. Confirmed against a
-# real run where a screenshot taken immediately after navigate came back visibly
-# blank on a readyState-complete page. Standardized to the same value as
-# TEXT_READ_SETTLE_DELAY_S below (was 2.0 here, briefly tried 0.5, settled on
-# 1.5 as the middle ground - enough margin to avoid the blank-screenshot case
-# without paying the full original 2.0s on every screenshot). The `wait` action
-# is still promoted in the prompt as the explicit escape hatch for the slower
-# pages even 1.5s isn't enough for, instead of raising this further for everyone.
-# Flat hardcoded wait, not adaptive - revisit with a real signal (network-idle,
-# poll for non-empty content) if 1.5s+prompted `wait` proves insufficient.
+# document.readyState hitting "complete" doesn't mean a client-rendered page
+# (React/Next.js, lazy images, fade-ins) has actually painted yet - a flat
+# settle delay before screenshotting or reading text avoids the common case
+# of capturing a still-blank/placeholder page. Not adaptive; `wait` is the
+# prompted escape hatch when a page needs longer than this.
 SCREENSHOT_SETTLE_DELAY_S = 1.5
-
-# Same readyState-isn't-enough problem as above, but for text/DOM reads
-# (get_page_text, read_page, execute_js) rather than screenshots - confirmed
-# against real runs hitting a site's own transient "there was an error while
-# loading" placeholder text immediately after navigate. Standardized to the
-# same value as SCREENSHOT_SETTLE_DELAY_S above (this one was already 1.5,
-# unchanged) - one settle delay for both cases rather than two separate
-# tuned numbers, with the standalone `wait` action as the explicit escape
-# hatch for slower pages either value isn't enough for.
 TEXT_READ_SETTLE_DELAY_S = 1.5
 
 # Directory containing browser tool utility files (JS scripts)
@@ -216,21 +213,13 @@ MAX_NETWORK_BODY_CHARS = 20000
 
 def capture_network_response(response, log: "deque[NetworkLogEntry]", counter: "count") -> None:
     """Synchronous capture of one response into `log`, id-tagged from
-    `counter`. Module-level (not bound to a BrowserTool instance) so it can
-    be attached to any page/log pair - BrowserTool's own single-page capture
-    uses its own self._network_log/self._network_log_counter, and
-    run_script's per-item pages use a fresh log/counter per item (see
-    script_runner.py) - the capture and entry shape are identical either
-    way, only which log/page they're bound to differs.
-
-    Playwright event handlers are invoked synchronously (not awaited), so
-    this only does synchronous work (response.status/.headers and
-    request.method/.resource_type are all available without an await); the
-    body - which does need an await - is captured separately via a
-    scheduled task (capture_network_response_body), only for content-types
-    worth reading as text. Never lets a logging failure break the actual
-    page interaction that triggered the request.
-    """
+    `counter`. Module-level rather than bound to a BrowserTool instance so
+    it can be attached to any page/log pair (BrowserTool's own page, or a
+    run_script per-item page - see script_runner.py). Playwright invokes
+    response handlers synchronously, so the body (which needs an await) is
+    read separately via a scheduled task, only for text-like content-types.
+    Swallows exceptions so a logging failure never breaks the page
+    interaction that triggered the request."""
     try:
         request = response.request
         content_type = response.headers.get("content-type", "")
@@ -443,24 +432,13 @@ async def wait_for_page_ready(
     poll_interval: float = 0.3,
     settle_delay_s: float = SCREENSHOT_SETTLE_DELAY_S,
 ) -> None:
-    """Check whether a page has actually finished loading before reading it
-    (screenshot, text, JS); if not, wait briefly and re-check rather than
-    capturing a half-loaded page. Gives up after timeout_s - reading a
-    still-loading (or frozen) page is still better than not reading at all.
-
-    Wrapped in a hard asyncio.wait_for: if the page is genuinely frozen (JS
-    engine stuck, a blocking native dialog, etc.) a single page.evaluate()
-    call can hang indefinitely, which the elapsed-time bookkeeping alone
-    wouldn't catch - the outer timeout guarantees this always returns.
-
-    readyState alone isn't enough (see SCREENSHOT_SETTLE_DELAY_S) - after the
-    poll gives up or succeeds, wait settle_delay_s more before returning, so
-    the caller's read has a better chance of seeing actually-painted/settled
-    content. Factored out to take a Page directly (not self._page) so
-    tools/script_runner.py can reuse it for the per-item pages it drives
-    outside BrowserTool's own single-page session - see capture_screenshot
-    just below for the same reasoning.
-    """
+    """Poll document.readyState until "complete" (or timeout_s elapses -
+    reading a still-loading page beats not reading at all), then wait
+    settle_delay_s more since readyState alone doesn't mean the page has
+    actually painted (see SCREENSHOT_SETTLE_DELAY_S). Wrapped in
+    asyncio.wait_for so a genuinely frozen page (stuck JS, a blocking native
+    dialog) can't hang this indefinitely. Takes a Page directly, not
+    self._page, so script_runner.py's per-item pages can reuse it too."""
 
     async def _poll() -> None:
         while True:
@@ -481,18 +459,11 @@ async def wait_for_page_ready(
 async def capture_screenshot(
     page: Page, run_dir: Path, *, width: int, height: int, full_page: bool = False
 ) -> ToolResult:
-    """Take a screenshot of a given Page and save it into run_dir, with the
-    same oversized-capture fallback chain BrowserTool._take_screenshot always
-    used: full page -> clipped to the top N viewports -> plain viewport,
-    whichever first comes in under MAX_SCREENSHOT_RAW_BYTES.
-
-    Factored out to take a Page (not self._page) so it's reusable by
-    anything that runs its own pages outside BrowserTool's single-page
-    session - see tools/script_runner.py, which runs one Page per item
-    concurrently and can't share BrowserTool's page across those.
-
-    Caller is responsible for any page-ready wait - this only captures.
-    """
+    """Screenshot a Page and save it into run_dir, falling back from full
+    page -> clipped top N viewports -> plain viewport until the result is
+    under MAX_SCREENSHOT_RAW_BYTES. Takes a Page directly (not self._page)
+    so script_runner.py's per-item pages can reuse it too. Caller is
+    responsible for any page-ready wait - this only captures."""
     try:
         if full_page:
             page_height = await page.evaluate("document.documentElement.scrollHeight")
@@ -557,23 +528,10 @@ async def capture_screenshot(
 
 
 class BrowserTool:
-    """
-    A browser automation tool using Playwright for web interaction.
-
-    Key actions for extracting content:
-    - read_page: Extract structured DOM tree with element references (USE THIS for analyzing page structure)
-    - get_page_text: Extract all text content from the page (USE THIS for reading articles/posts)
-    - screenshot: Take a visual screenshot (only for visual confirmation, not for reading content)
-
-    Navigation actions:
-    - navigate: Go to a URL
-    - find: Search for elements on the page
-
-    Interaction actions:
-    - left_click, right_click, double_click: Click elements
-    - type: Enter text
-    - scroll: Scroll the page
-    """
+    """A browser automation tool using Playwright for web interaction - see
+    BROWSER_TOOL_DESCRIPTION/BROWSER_TOOL_INPUT_SCHEMA above for the full,
+    current action list (kept there as the single source of truth rather
+    than duplicated here)."""
 
     name: Literal["browser"] = "browser"
 
@@ -591,31 +549,24 @@ class BrowserTool:
                 flat OUTPUT_DIR root (used by tests/non-Streamlit callers).
         """
         super().__init__()
-        # Use constants for display configuration
         self.width = BROWSER_WIDTH
         self.height = BROWSER_HEIGHT
         self.run_dir = run_dir if run_dir is not None else OUTPUT_DIR
         self._initialized = False
-        self._event_loop = None  # Track which event loop we're initialized in
-        self.cdp_url = None  # Initialize CDP URL attribute for cleanup method
+        self._event_loop = None  # which event loop we're initialized in
+        self.cdp_url = None
         # Last full DOM tree seen (via navigate or read_page) - the baseline
         # that DOM_MUTATING_ACTIONS get diffed against. See _attach_dom_context.
         self._last_dom_snapshot: Optional[str] = None
-        # Passive capture of every response this session, for the
-        # network_list_types/network_list/network_inspect actions - see
-        # _on_network_response. Persists across navigations (not cleared on
-        # navigate) so a request made just before navigating away is still
-        # inspectable afterward.
+        # Persists across navigations (not cleared on navigate), so a
+        # request made just before navigating away is still inspectable.
         self._network_log: "deque[NetworkLogEntry]" = deque(maxlen=MAX_NETWORK_LOG_ENTRIES)
         self._network_log_counter = count(1)
 
     @property
     def options(self) -> BrowserOptions:
-        """Return browser display options."""
-        # Note: This implementation uses fixed 1920x1080 dimensions with empirical
-        # coordinate correction. For the recommended approach using client-side
-        # downscaling, see the "Handle coordinate scaling" section in the computer
-        # use documentation.
+        """Fixed 1920x1080 with empirical coordinate correction (see
+        CoordinateScaler), not client-side downscaling."""
         return {
             "display_width_px": self.width,
             "display_height_px": self.height,
@@ -623,41 +574,15 @@ class BrowserTool:
 
     async def _ensure_browser(self) -> None:
         """Launch browser and ensure page is ready."""
-        # NOTE: We intentionally DON'T reset the browser if the event loop changes
-        # The browser should persist across conversation turns
-        # Commenting out event loop check that was causing browser resets:
-        # try:
-        #     current_loop = asyncio.get_running_loop()
-        #     if self._initialized and hasattr(self, "_event_loop"):
-        #         if self._event_loop != current_loop:
-        #             self._initialized = False
-        #             self._browser = None
-        #             self._context = None
-        #             self._page = None
-        #             self._playwright = None
-        # except RuntimeError:
-        #     pass
-
+        # Intentionally does NOT reset the browser if the event loop changes -
+        # it should persist across conversation turns.
         if self._initialized:
-            print(
-                f"[Browser] Reusing existing browser instance",
-                file=sys.stderr,
-                flush=True,
-            )
+            _debug("[Browser] Reusing existing browser instance")
             if self._page:
-                current_url = self._page.url
-                print(
-                    f"[Browser] Current page URL: {current_url}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+                _debug(f"[Browser] Current page URL: {self._page.url}")
 
         if not self._initialized:
-            print(
-                f"[Browser] Initializing browser for first time",
-                file=sys.stderr,
-                flush=True,
-            )
+            _debug("[Browser] Initializing browser for first time")
             if self._playwright is None:
                 from playwright.async_api import async_playwright
 
@@ -691,11 +616,7 @@ class BrowserTool:
                         "--disable-component-extensions-with-background-pages",
                     ])
 
-                print(
-                    f"[Browser] Launching browser with viewport {viewport_width}x{viewport_height}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+                _debug(f"[Browser] Launching browser with viewport {viewport_width}x{viewport_height}")
 
                 self._browser = await self._playwright.chromium.launch(
                     headless=False,
@@ -710,16 +631,8 @@ class BrowserTool:
                 self._page.set_default_timeout(30000)
                 self._page.on("response", self._on_network_response)
 
-                print(
-                    f"[Browser] Browser initialized with viewport: {viewport_width}x{viewport_height}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                print(
-                    f"[Browser] New browser instance created",
-                    file=sys.stderr,
-                    flush=True,
-                )
+                _debug(f"[Browser] Browser initialized with viewport: {viewport_width}x{viewport_height}")
+                _debug("[Browser] New browser instance created")
 
             self._initialized = True
             try:
@@ -738,10 +651,8 @@ class BrowserTool:
 
         script = script_path.read_text()
 
-        # Special handling for browser_dom_script.js
         if filename == "browser_dom_script.js":
-            # The DOM script defines window.__generateAccessibilityTree function
-            # We need to inject it and then call it
+            # Injects window.__generateAccessibilityTree, then calls it
             filter_type = args[0] if args else ""
             combined_expression = f"""
                 (function() {{
@@ -794,14 +705,11 @@ class BrowserTool:
         try:
             await self._wait_for_page_ready()
 
-            # Take screenshot with clipping
             screenshot_path = self.run_dir / f"zoom_screenshot_{uuid4().hex}.png"
             await self._page.screenshot(
                 path=str(screenshot_path),
                 clip={"x": x, "y": y, "width": width, "height": height},
             )
-
-            # Read the file and encode to base64
             screenshot_bytes = screenshot_path.read_bytes()
             image_base64 = base64.b64encode(screenshot_bytes).decode()
 
@@ -820,56 +728,30 @@ class BrowserTool:
             elif url == "forward":
                 await self._page.go_forward(wait_until="domcontentloaded")
             else:
-                # Add protocol if missing
                 if not url.startswith(("http://", "https://", "file://", "about:")):
                     url = f"https://{url}"
                 await self._page.goto(url, wait_until="domcontentloaded")
 
-            # Take screenshot after navigation - _take_screenshot itself
-            # verifies the page actually finished loading first
+            # _take_screenshot verifies the page has actually finished loading first
             return await self._take_screenshot()
 
         except Exception as e:
             raise ToolError(f"Failed to navigate to {url}: {str(e)}") from e
 
     def _scale_coordinates(self, x: int, y: int) -> tuple[int, int]:
-        """
-        Apply auto-scaling to coordinates using the CoordinateScaler.
-
-        Claude's vision model interprets images at a different resolution than actual.
-        We use empirically-derived base resolution for accurate coordinate mapping.
-
-        Args:
-            x: Original x coordinate
-            y: Original y coordinate
-
-        Returns:
-            Tuple of (scaled_x, scaled_y)
-        """
-        # Get scale factors for this viewport
+        """Scale a coordinate Claude gave us (interpreted at its own vision
+        resolution) to this browser's actual viewport resolution."""
         scale_x, scale_y = CoordinateScaler.get_scale_factors(self.width, self.height)
 
-        # Only log scale factors if they're being initialized
         if not hasattr(self, '_logged_scale_factors'):
-            print(
-                f"[Auto-Scale] Using scale factors: {scale_x:.3f}x, {scale_y:.3f}y",
-                file=sys.stderr,
-                flush=True,
-            )
+            _debug(f"[Auto-Scale] Using scale factors: {scale_x:.3f}x, {scale_y:.3f}y")
             self._logged_scale_factors = True
 
-        # Apply scaling using CoordinateScaler
         scaled_x, scaled_y = CoordinateScaler.scale_coordinates(
             x, y, self.width, self.height
         )
-
-        # Log if scaling was actually applied
         if scaled_x != x or scaled_y != y:
-            print(
-                f"[Auto-Scale] Scaled ({x}, {y}) -> ({scaled_x}, {scaled_y})",
-                file=sys.stderr,
-                flush=True,
-            )
+            _debug(f"[Auto-Scale] Scaled ({x}, {y}) -> ({scaled_x}, {scaled_y})")
 
         return scaled_x, scaled_y
 
@@ -899,61 +781,26 @@ class BrowserTool:
 
             if coordinate:
                 x, y = coordinate
-
-                # Apply auto-scaling to coordinates
                 x, y = self._scale_coordinates(x, y)
+                _warn_if_out_of_viewport(x, y, self._page.viewport_size)
 
-                # Validate coordinates are within viewport bounds
-                viewport = self._page.viewport_size
-                if viewport:
-                    if x < 0 or x > viewport['width'] or y < 0 or y > viewport['height']:
-                        print(
-                            f"[Click] WARNING: Coordinates ({x}, {y}) are outside viewport "
-                            f"({viewport['width']}x{viewport['height']})",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        # Still attempt the click but warn about potential issues
-                        if x > viewport['width']:
-                            print(
-                                f"[Click] X coordinate {x} exceeds viewport width {viewport['width']}",
-                                file=sys.stderr,
-                                flush=True,
-                            )
-                        if y > viewport['height']:
-                            print(
-                                f"[Click] Y coordinate {y} exceeds viewport height {viewport['height']}",
-                                file=sys.stderr,
-                                flush=True,
-                            )
-
-                # Ensure the page has focus
                 await self._page.bring_to_front()
-
-                # Move mouse to position and click
                 await self._page.mouse.move(x, y)
-                await asyncio.sleep(0.01)  # Small delay to ensure mouse is positioned
-
-                # Perform the click based on type
+                await asyncio.sleep(0.01)  # let the mouse settle before clicking
                 await self._page.mouse.click(
                     x, y, button=button, click_count=click_count
                 )
                 return ToolResult(output=f"Clicked at ({x}, {y})", error=None)
             elif ref:
-                # Use the browser_element_script.js to find and click element
                 element_info = await self._execute_js_from_file(
                     "browser_element_script.js", ref
                 )
-
                 if not element_info.get("success", False):
                     raise ToolError(
                         element_info.get("message", "Failed to find element")
                     )
 
-                # Get the coordinates from element_info
                 click_x, click_y = element_info["coordinates"]
-
-                # Move to element and click
                 await self._page.mouse.move(click_x, click_y)
                 await asyncio.sleep(0.1)
                 await self._page.mouse.click(
@@ -961,7 +808,6 @@ class BrowserTool:
                 )
                 return ToolResult(output=f"Clicked element with ref: {ref}", error=None)
             elif text:
-                # Click on element containing text
                 await self._page.click(
                     f"text={text}", button=button, click_count=click_count
                 )
@@ -993,7 +839,6 @@ class BrowserTool:
             raise ToolError("Browser not initialized")
 
         try:
-            # Load the key map
             from ..browser_tool_utils.browser_key_map import KEY_MAP
 
             def map_key(k: str) -> str:
@@ -1003,15 +848,13 @@ class BrowserTool:
                     return key_info["key"]
                 return k
 
-            # Handle key combinations (e.g., "cmd+a", "ctrl+c")
-            if "+" in key:
+            if "+" in key:  # combination, e.g. "cmd+a", "ctrl+c"
                 parts = key.split("+")
                 mapped_parts = [map_key(p) for p in parts]
                 mapped_key = "+".join(mapped_parts)
                 await self._page.keyboard.press(mapped_key)
                 return ToolResult(output=f"Pressed key combination: {mapped_key}", error=None)
 
-            # Map single key if needed
             key_info = KEY_MAP.get(key.lower())
             if key_info:
                 key_to_press = key_info["code"] if "code" in key_info else key
@@ -1065,19 +908,9 @@ class BrowserTool:
                 x, y = coordinate
                 await self._page.mouse.wheel(delta_x, delta_y)
             else:
-                # Scroll the main page
                 await self._page.evaluate(f"window.scrollBy({delta_x}, {delta_y})")
 
-            # Wait for content to stabilize after scroll
-            await asyncio.sleep(0.5)
-
-            # Take screenshot to show new viewport content
-            screenshot_result = await self._take_screenshot()
-            return ToolResult(
-                output=f"Scrolled {direction} by {amount} units",
-                error=None,
-                base64_image=screenshot_result.base64_image
-            )
+            return await self._settle_and_screenshot(f"Scrolled {direction} by {amount} units")
 
         except Exception as e:
             raise ToolError(f"Failed to scroll: {str(e)}") from e
@@ -1091,23 +924,20 @@ class BrowserTool:
             element_info = await self._execute_js_from_file(
                 "browser_element_script.js", ref
             )
-
             if not element_info["success"]:
                 raise ToolError(element_info.get("message", "Failed to find element"))
 
-            # Wait for content to stabilize after scroll
-            await asyncio.sleep(0.5)
-
-            # Take screenshot to show new viewport content
-            screenshot_result = await self._take_screenshot()
-            return ToolResult(
-                output=f"Scrolled to element with ref: {ref}",
-                error=None,
-                base64_image=screenshot_result.base64_image
-            )
+            return await self._settle_and_screenshot(f"Scrolled to element with ref: {ref}")
 
         except Exception as e:
             raise ToolError(f"Failed to scroll to element: {str(e)}") from e
+
+    async def _settle_and_screenshot(self, message: str, delay: float = 0.5) -> ToolResult:
+        """Wait for content to stabilize after a scroll/hover, then
+        screenshot the new viewport - shared by _scroll, _scroll_to, _hover."""
+        await asyncio.sleep(delay)
+        screenshot_result = await self._take_screenshot()
+        return ToolResult(output=message, error=None, base64_image=screenshot_result.base64_image)
 
     async def _drag(
         self, start_x: int, start_y: int, end_x: int, end_y: int
@@ -1140,9 +970,7 @@ class BrowserTool:
             raise ToolError("Browser not initialized")
 
         try:
-            # Apply auto-scaling to coordinates
             scaled_x, scaled_y = self._scale_coordinates(x, y)
-
             await self._page.mouse.move(scaled_x, scaled_y)
             await self._page.mouse.down()
             return ToolResult(output=f"Mouse down at ({scaled_x}, {scaled_y})", error=None)
@@ -1156,9 +984,7 @@ class BrowserTool:
             raise ToolError("Browser not initialized")
 
         try:
-            # Apply auto-scaling to coordinates
             scaled_x, scaled_y = self._scale_coordinates(x, y)
-
             await self._page.mouse.move(scaled_x, scaled_y)
             await self._page.mouse.up()
             return ToolResult(output=f"Mouse up at ({scaled_x}, {scaled_y})", error=None)
@@ -1171,57 +997,30 @@ class BrowserTool:
         coordinate: Optional[tuple[int, int]] = None,
         ref: Optional[str] = None,
     ) -> ToolResult:
-        """
-        Move the mouse cursor to a position without clicking.
-        Useful for revealing tooltips, dropdown menus, or triggering hover states.
-        """
+        """Move the mouse without clicking, e.g. to reveal a tooltip/dropdown."""
         if self._page is None:
             raise ToolError("Browser not initialized")
 
         try:
-            # Prefer ref over coordinate (refs are more reliable)
-            if ref:
-                # Use the browser_element_script.js to find element coordinates
+            if ref:  # refs are more reliable than coordinates when both are available
                 element_info = await self._execute_js_from_file(
                     "browser_element_script.js", ref
                 )
-
                 if not element_info.get("success", False):
                     raise ToolError(
                         element_info.get("message", "Failed to find element")
                     )
 
-                # Get the coordinates from element_info
                 hover_x, hover_y = element_info["coordinates"]
-
                 await self._page.bring_to_front()
                 await self._page.mouse.move(hover_x, hover_y)
-                # Wait for hover effects to render
-                await asyncio.sleep(0.5)
-                # Take screenshot to show hover result
-                screenshot_result = await self._take_screenshot()
-                return ToolResult(
-                    output=f"Hovered over element with ref: {ref}",
-                    error=None,
-                    base64_image=screenshot_result.base64_image
-                )
+                return await self._settle_and_screenshot(f"Hovered over element with ref: {ref}")
             elif coordinate:
                 x, y = coordinate
-                # Apply auto-scaling to coordinates
                 scaled_x, scaled_y = self._scale_coordinates(x, y)
-
                 await self._page.bring_to_front()
                 await self._page.mouse.move(scaled_x, scaled_y)
-
-                # Wait for hover effects to render
-                await asyncio.sleep(0.3)
-                # Take screenshot to show hover result
-                screenshot_result = await self._take_screenshot()
-                return ToolResult(
-                    output=f"Hovered at ({scaled_x}, {scaled_y})",
-                    error=None,
-                    base64_image=screenshot_result.base64_image
-                )
+                return await self._settle_and_screenshot(f"Hovered at ({scaled_x}, {scaled_y})", delay=0.3)
             else:
                 raise ToolError(
                     "Either coordinate or ref is required for hover action"
@@ -1320,22 +1119,8 @@ class BrowserTool:
             await self._wait_for_page_ready(settle_delay_s=TEXT_READ_SETTLE_DELAY_S)
             full_content = await self._current_dom_text(filter_type)
 
-            # Calculate content size for summary
-            content_length = len(full_content)
-            # Estimate token count
-            # Note: For exact counts, use client.beta.messages.count_tokens API
-            # This estimate uses ~3.5 chars/token which is typical for Claude with English text
-            # Actual ratio varies by content type (code, languages, special characters)
-            estimated_tokens = int(content_length / 3.5)
-
-            # Create a summary for UI display
-            summary = f"Extracted page DOM tree (~{estimated_tokens:,} tokens, {content_length:,} characters)"
-
-            # Return the full content for the API but with a marker for the UI
-            return ToolResult(
-                output=f"__PAGE_EXTRACTED__\n{summary}\n__FULL_CONTENT__\n{full_content}",
-                error=None
-            )
+            summary = f"Extracted page DOM tree (~{_estimate_tokens(len(full_content)):,} tokens, {len(full_content):,} characters)"
+            return _wrap_extraction("PAGE_EXTRACTED", summary, full_content)
 
         except Exception as e:
             raise ToolError(f"Failed to read page: {str(e)}") from e
@@ -1352,37 +1137,22 @@ class BrowserTool:
 
         try:
             await self._wait_for_page_ready(settle_delay_s=TEXT_READ_SETTLE_DELAY_S)
-            # Use the browser_text_script.js from reference implementation
             result = await self._execute_js_from_file("browser_text_script.js")
 
-            # Format the output like the reference implementation
             if isinstance(result, dict):
                 full_content = f"""Title: {result.get("title", "N/A")}
 URL: {result.get("url", "N/A")}
 Source element: <{result.get("source", "unknown")}>
 ---
 {result.get("text", "")}"""
+                title, url = result.get("title", "N/A"), result.get("url", "N/A")
             else:
                 full_content = str(result)
+                title, url = "N/A", "N/A"
 
-            # Calculate content size for summary
-            content_length = len(full_content)
-            # Estimate token count
-            # Note: For exact counts, use client.beta.messages.count_tokens API
-            # This estimate uses ~3.5 chars/token which is typical for Claude with English text
-            # Actual ratio varies by content type (code, languages, special characters)
-            estimated_tokens = int(content_length / 3.5)
-
-            # Create a summary for UI display
-            title = result.get("title", "N/A") if isinstance(result, dict) else "N/A"
-            url = result.get("url", "N/A") if isinstance(result, dict) else "N/A"
-            summary = f"Extracted page text from: {title}\nURL: {url}\n(~{estimated_tokens:,} tokens, {content_length:,} characters)"
-
-            # Return the full content for the API but with a marker for the UI
-            return ToolResult(
-                output=f"__TEXT_EXTRACTED__\n{summary}\n__FULL_CONTENT__\n{full_content}",
-                error=None
-            )
+            tokens, chars = _estimate_tokens(len(full_content)), len(full_content)
+            summary = f"Extracted page text from: {title}\nURL: {url}\n(~{tokens:,} tokens, {chars:,} characters)"
+            return _wrap_extraction("TEXT_EXTRACTED", summary, full_content)
 
         except Exception as e:
             raise ToolError(f"Failed to get page text: {str(e)}") from e
@@ -1409,23 +1179,35 @@ Source element: <{result.get("source", "unknown")}>
         return ToolResult(output=network_inspect_text(self._network_log, entry_id))
 
     async def _find(self, search_query: str) -> ToolResult:
-        """Find elements on the page matching the search query using AI."""
+        """Find elements matching search_query - AI-assisted read of the
+        accessibility tree (real ref_ids) when ANTHROPIC_API_KEY is set,
+        falling back to a plain :has-text() CSS match otherwise or if the
+        AI path fails for any reason."""
         if self._page is None:
             raise ToolError("Browser not initialized")
 
         try:
-            # First get the DOM tree for analysis
             dom_tree_json = await self._current_dom_text("all")
 
-            # Try to use Anthropic API if available
             api_key = os.environ.get("ANTHROPIC_API_KEY")
             if api_key:
                 try:
-                    from anthropic import AsyncAnthropic
+                    return await self._find_via_ai(search_query, dom_tree_json, api_key)
+                except Exception:
+                    pass  # fall through to the plain text-search path below
 
-                    client = AsyncAnthropic(api_key=api_key)
+            return await self._find_by_text_search(search_query)
 
-                    prompt = f"""You are helping find elements on a web page. The user wants to find: "{search_query}"
+        except Exception as e:
+            raise ToolError(f"Failed to find elements: {str(e)}") from e
+
+    async def _find_via_ai(self, search_query: str, dom_tree_json: str, api_key: str) -> ToolResult:
+        """Ask Claude to pick matching elements out of the accessibility
+        tree; raises on any API/parsing failure so _find can fall back."""
+        from anthropic import AsyncAnthropic
+
+        client = AsyncAnthropic(api_key=api_key)
+        prompt = f"""You are helping find elements on a web page. The user wants to find: "{search_query}"
 
 Here is the accessibility tree of the page:
 {dom_tree_json}
@@ -1448,116 +1230,90 @@ If no matching elements are found, return only:
 FOUND: 0
 ERROR: explanation of why no elements were found"""
 
-                    response = await client.messages.create(
-                        model=FIND_MODEL,
-                        max_tokens=800,
-                        temperature=1.0,
-                        messages=[{"role": "user", "content": prompt}],
-                    )
+        response = await client.messages.create(
+            model=FIND_MODEL,
+            max_tokens=800,
+            temperature=1.0,
+            messages=[{"role": "user", "content": prompt}],
+        )
 
-                    # Handle the response properly
-                    first_content = response.content[0]
-                    if hasattr(first_content, "text"):
-                        response_text = first_content.text.strip()
-                    else:
-                        # Handle other content types if needed
-                        response_text = str(first_content)
-                    lines = [
-                        line.strip()
-                        for line in response_text.split("\n")
-                        if line.strip()
-                    ]
+        first_content = response.content[0]
+        response_text = first_content.text.strip() if hasattr(first_content, "text") else str(first_content)
 
+        total_found, elements, has_more, error_message = self._parse_find_response(response_text)
+        if total_found == 0 or not elements:
+            return ToolResult(output=error_message or "No matching elements found", error=None)
+        return ToolResult(output=self._format_find_elements(total_found, elements, has_more), error=None)
+
+    @staticmethod
+    def _parse_find_response(response_text: str) -> tuple[int, list[dict], bool, Optional[str]]:
+        """Parse the FOUND:/ERROR:/MORE:/ref_X lines out of _find_via_ai's
+        prompt's free-text response format (SHOWING: is ignored - the shown
+        count is just len(elements))."""
+        total_found = 0
+        elements: list[dict] = []
+        has_more = False
+        error_message = None
+
+        for line in (l.strip() for l in response_text.split("\n") if l.strip()):
+            if line.startswith("FOUND:"):
+                try:
+                    total_found = int(line.split(":")[1].strip())
+                except (ValueError, IndexError):
                     total_found = 0
-                    elements = []
-                    has_more = False
-                    error_message = None
+            elif line.startswith("ERROR:"):
+                error_message = line[6:].strip()
+            elif line.startswith("MORE:"):
+                has_more = True
+            elif line.startswith("ref_") and "|" in line:
+                parts = [p.strip() for p in line.split("|")]
+                if len(parts) >= 4:
+                    elements.append({
+                        "ref": parts[0],
+                        "role": parts[1],
+                        "name": parts[2] if len(parts) > 2 else "",
+                        "type": parts[3] if len(parts) > 3 else "",
+                        "description": parts[4] if len(parts) > 4 else "",
+                    })
 
-                    for line in lines:
-                        if line.startswith("FOUND:"):
-                            try:
-                                total_found = int(line.split(":")[1].strip())
-                            except (ValueError, IndexError):
-                                total_found = 0
-                        elif line.startswith("SHOWING:"):
-                            pass
-                        elif line.startswith("ERROR:"):
-                            error_message = line[6:].strip()
-                        elif line.startswith("MORE:"):
-                            has_more = True
-                        elif line.startswith("ref_") and "|" in line:
-                            parts = [p.strip() for p in line.split("|")]
-                            if len(parts) >= 4:
-                                elements.append(
-                                    {
-                                        "ref": parts[0],
-                                        "role": parts[1],
-                                        "name": parts[2] if len(parts) > 2 else "",
-                                        "type": parts[3] if len(parts) > 3 else "",
-                                        "description": parts[4]
-                                        if len(parts) > 4
-                                        else "",
-                                    }
-                                )
+        return total_found, elements, has_more, error_message
 
-                    if total_found == 0 or len(elements) == 0:
-                        return ToolResult(
-                            output=error_message or "No matching elements found",
-                            error=None,
-                        )
+    @staticmethod
+    def _format_find_elements(total_found: int, elements: list[dict], has_more: bool) -> str:
+        message = f"Found {total_found} matching element{'s' if total_found != 1 else ''}"
+        if has_more:
+            message += f" (showing first {len(elements)}, use a more specific query to narrow results)"
 
-                    message = f"Found {total_found} matching element{'s' if total_found != 1 else ''}"
-                    if has_more:
-                        message += f" (showing first {len(elements)}, use a more specific query to narrow results)"
+        lines = []
+        for el in elements:
+            line = f"- {el['ref']}: {el['role']}"
+            if el.get("name"):
+                line += f" {el['name']}"
+            if el.get("type"):
+                line += f" {el['type']}"
+            if el.get("description"):
+                line += f" - {el['description']}"
+            lines.append(line)
 
-                    # Format elements for output
-                    elements_output = []
-                    for el in elements:
-                        element_str = f"- {el['ref']}: {el['role']}"
-                        if el.get("name"):
-                            element_str += f" {el['name']}"
-                        if el.get("type"):
-                            element_str += f" {el['type']}"
-                        if el.get("description"):
-                            element_str += f" - {el['description']}"
-                        elements_output.append(element_str)
+        return f"{message}\n\n" + "\n".join(lines)
 
-                    elements_str = "\n".join(elements_output)
-                    return ToolResult(output=f"{message}\n\n{elements_str}", error=None)
-
-                except Exception:
-                    pass  # Failed to use AI for find, falling back to simple search
-
-            # Fallback to simple text search if AI is not available
-            elements = await self._page.query_selector_all(
-                f"*:has-text('{search_query}')"
-            )
-
-            if not elements:
-                return ToolResult(
-                    output=f"No matching elements found for: {search_query}", error=None
-                )
-
-            # For simple fallback, just report count (no ref_ids without AI analysis)
-            return ToolResult(
-                output=f"Found {len(elements)} matching element{'s' if len(elements) != 1 else ''} (Note: AI-based search with ref_ids requires ANTHROPIC_API_KEY)",
-                error=None,
-            )
-
-        except Exception as e:
-            raise ToolError(f"Failed to find elements: {str(e)}") from e
+    async def _find_by_text_search(self, search_query: str) -> ToolResult:
+        """Plain CSS :has-text() match - no ref_ids, just a count."""
+        elements = await self._page.query_selector_all(f"*:has-text('{search_query}')")
+        if not elements:
+            return ToolResult(output=f"No matching elements found for: {search_query}", error=None)
+        return ToolResult(
+            output=f"Found {len(elements)} matching element{'s' if len(elements) != 1 else ''} (Note: AI-based search with ref_ids requires ANTHROPIC_API_KEY)",
+            error=None,
+        )
 
     async def _outline(self, ref: str) -> ToolResult:
         """Draw a bounding box around one element and screenshot it, then
-        remove the box. A visual complement to find/execute_js: confirms
-        which element a ref actually resolves to by making it directly
-        visible, rather than trusting the ref's reported text/role alone.
-
-        Named "outline", not "highlight" - a real run showed the model
-        conflating our tool with a task's own use of "highlight" (e.g. a
-        Wikipedia page's native highlighted-section behavior), reimplementing
-        this exact box-drawing pattern by hand instead of searching the page
-        for what the task actually meant. See browser_use_demo/loop.py."""
+        remove the box - confirms which element a ref actually resolves to
+        by making it directly visible, rather than trusting its reported
+        text/role alone. Named "outline", not "highlight", to avoid the
+        model confusing this action with a task's own use of that word
+        (e.g. a page's native highlighted-section behavior) - see loop.py."""
         if self._page is None:
             raise ToolError("Browser not initialized")
 
@@ -1688,24 +1444,9 @@ ERROR: explanation of why no elements were found"""
         full_page: bool = False,
         **kwargs,
     ) -> ToolResult:
-        """
-        Execute browser actions.
-
-        Parameters:
-        - action: The action to perform
-        - text: Text input for type, key, navigate, find actions
-        - ref: Element reference for element-based actions
-        - coordinate: (x, y) coordinates for mouse actions
-        - start_coordinate: Starting point for drag actions
-        - scroll_direction: Direction for scroll action
-        - scroll_amount: Amount to scroll
-        - duration: Duration for wait or hold_key actions
-        - value: Value for form_input action
-        - region: (x, y, width, height) for zoom screenshot
-        - full_page: For screenshot action, capture the entire page instead of viewport
-        """
-
-        # Ensure browser is running for all actions
+        """Execute one browser action - see BROWSER_TOOL_INPUT_SCHEMA above
+        for which parameters each action actually uses. region is
+        (x1, y1, x2, y2) corners, converted to x/y/width/height below."""
         await self._ensure_browser()
 
         if action == "navigate":
@@ -1722,7 +1463,6 @@ ERROR: explanation of why no elements were found"""
                     "Region (x1, y1, x2, y2) is required for zoom action"
                 )
             x1, y1, x2, y2 = region
-            # Convert corner coordinates to x, y, width, height
             x = min(x1, x2)
             y = min(y1, y2)
             width = abs(x2 - x1)
@@ -1836,15 +1576,12 @@ ERROR: explanation of why no elements were found"""
             raise ToolError(f"Unknown action: {action}")
 
     async def cleanup(self):
-        """Cleanup method to ensure browser is closed properly."""
-        # Clean up browser resources
         if self.cdp_url:
-            # When connected to CDP server, just disconnect without closing tabs
+            # CDP connection: just disconnect, don't close the remote tabs
             self._page = None
             self._context = None
             self._browser = None
         else:
-            # For local browser, close everything
             if self._page:
                 await self._page.close()
                 self._page = None

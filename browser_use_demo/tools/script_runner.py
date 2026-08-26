@@ -1,53 +1,36 @@
-"""#9 from TODO.md: a general script/recipe runner over the browser tool's
-own action vocabulary - replays a fixed sequence of steps once per item, no
-LLM invoked per item, matching the exact principle that already motivates
-batch_extract (the cost being avoided is agent reasoning/round-trips, not
-wall-clock).
+"""A recipe runner over the browser tool's own action vocabulary: replays a
+fixed sequence of steps once per item, with no LLM invoked per item.
+Whether a script fetches (raw HTTP, fast) or navigates (a real rendered
+page) falls out of which steps you put in it, not a separate flag or tool.
 
-Subsumes what would otherwise be three separate proposals: whether a script
-fetches (fast, raw HTTP) or navigates (a real rendered page, JS runs), and
-whether it screenshots or not, falls out of which steps you put in it - not
-a flag, and not a different tool for each shape.
-
-Scope: the step vocabulary is the "structured extraction/capture" subset of
-the browser tool's own actions - navigate, screenshot, get_page_text,
+Step vocabulary is the "structured extraction/capture" subset of the
+browser tool's own actions - navigate, screenshot, get_page_text,
 execute_js, wait, scroll_to, network_list_types, network_list,
-network_inspect. NOT included, deliberately: click/type/drag/hover/
-form_input/key (real interaction) - items that need genuine per-item
-reasoning or interaction belong in dispatch_subagents, not here; that
-boundary is drawn on purpose, not a gap.
+network_inspect. Deliberately excludes click/type/drag/hover/form_input/
+key - items needing real per-item interaction/judgment belong in
+dispatch_subagents instead.
 
-scroll_to here is NOT the ref-based browser-tool action (a ref from
-read_page/find is a WeakRef into one page's own JS heap - meaningless on a
-different item's page, and there's no LLM in this loop to call read_page/
-find per item anyway). Instead it takes literal `text` that appears on the
-page - a substring match via page.get_by_text(text, exact=False), same
-mechanism and semantics as sub_browser_queue.py's own scroll_to step -
-resolved fresh against each item's own page, deterministic, no extra LLM/
-API call. Fits the existing "one fresh page per item, steps run in
-sequence on it" model exactly, contrary to the original v1 assumption that
-this needed a different execution model altogether.
+scroll_to takes literal `text` (a substring match via
+page.get_by_text(text, exact=False), same as sub_browser_queue.py's own
+scroll_to), not a browser-tool ref - a ref from read_page/find is a WeakRef
+into one page's JS heap, meaningless on a different item's page, and
+there's no LLM in this loop to call read_page/find per item anyway.
 
 network_list_types/network_list/network_inspect reuse the module-level
-capture_network_response/*_text functions factored out of browser.py's own
-network-capture methods - each full-mode item registers its own
-page.on("response", ...) into a fresh per-item log (only when the script
-actually uses one of these steps), so the three query actions read that
-item's own captured traffic. Fast-mode (fetch-only) scripts can't use these
-- there's no live page/response stream to capture there, only a single
-synchronous HTML response already returned in one shot.
+capture_network_response/*_text functions from browser.py: each full-mode
+item registers its own page.on("response", ...) into a fresh per-item log,
+only when the script actually uses one of these steps. Not available in
+fast/fetch mode - there's no live page/response stream there.
 
-Reuses AdaptiveRateLimiter, the rate-limit/transient-status handling, and
-the raw-fetch extraction wrapper from batch_extract.py directly - a script
-with no `navigate` step *is* batch_extract's exact mechanism, just reached
-through this tool's script shape instead of a separate one.
+Reuses AdaptiveRateLimiter and the raw-fetch extraction wrapper from
+batch_extract.py directly - a script with no `navigate` step *is*
+batch_extract's exact mechanism, reached through this tool's script shape.
 """
 
 import asyncio
 import json
 from collections import deque
 from itertools import count
-from pathlib import Path
 from typing import Any, Optional
 
 from claude_agent_sdk import tool as sdk_tool

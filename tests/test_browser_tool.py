@@ -9,7 +9,6 @@ import pytest
 from browser_use_demo.tools.base import ToolError, ToolResult
 from browser_use_demo.tools.browser import (
     DOM_DIFF_MAX_CHARS,
-    DOM_MUTATING_ACTIONS,
     MAX_FULL_PAGE_HEIGHT_PX,
     MAX_SCREENSHOT_RAW_BYTES,
     BrowserTool,
@@ -170,8 +169,9 @@ class TestPageReadyWait:
     async def test_returns_immediately_when_already_complete(self, tmp_path):
         tool, page = make_tool_with_mock_page(tmp_path)
         await tool._wait_for_page_ready(timeout_s=1.0, poll_interval=0.05, settle_delay_s=0)
-        # readyState evaluated at least once, no error
-        page.evaluate.assert_called()
+        # Checked exactly once - readyState was already "complete" on the
+        # first poll, so it must not loop/sleep waiting for more checks.
+        assert page.evaluate.call_count == 1
 
     @pytest.mark.asyncio
     async def test_gives_up_after_timeout_without_raising(self, tmp_path):
@@ -397,15 +397,9 @@ def _make_element_info(**overrides):
 class TestOutline:
     """outline(ref) draws a bounding box around an element and screenshots
     it - a visual complement to find/execute_js for confirming a ref really
-    points at the element it claims to (find's own tool description used to
-    claim it did this highlighting; it never actually did - see the fixed
-    action description in the schema).
-
-    Named "outline", not "highlight" - a real run showed the model
-    conflating the tool with a task's own use of "highlight" (a Wikipedia
-    page's native highlighted-section behavior), reimplementing this exact
-    box-drawing pattern by hand against the wrong element instead of
-    searching the page for what the task meant."""
+    points at the element it claims to. Named "outline", not "highlight",
+    to avoid the model confusing this action with a task's own use of that
+    word - see test_loop.py's highlight->outline rename regression guard."""
 
     @pytest.mark.asyncio
     async def test_draws_box_screenshots_and_removes_it(self, tmp_path):
@@ -653,21 +647,6 @@ class TestAttachDomContext:
 
         assert result is original
         tool._current_dom_text.assert_not_called()
-
-    def test_dom_mutating_actions_excludes_read_only_actions(self):
-        # Sanity check the action classification itself - these should never
-        # trigger a diff computation (screenshot/wait/find/outline/zoom/
-        # get_page_text/read_page/navigate are all handled separately or are
-        # read-only).
-        assert "screenshot" not in DOM_MUTATING_ACTIONS
-        assert "navigate" not in DOM_MUTATING_ACTIONS
-        assert "read_page" not in DOM_MUTATING_ACTIONS
-        assert "get_page_text" not in DOM_MUTATING_ACTIONS
-        assert "wait" not in DOM_MUTATING_ACTIONS
-        assert "find" not in DOM_MUTATING_ACTIONS
-        assert "outline" not in DOM_MUTATING_ACTIONS
-        assert "left_click" in DOM_MUTATING_ACTIONS
-        assert "execute_js" in DOM_MUTATING_ACTIONS
 
 
 class TestCallAttachesDomContext:

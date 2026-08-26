@@ -133,25 +133,37 @@ class TestConcurrencyCap:
 
     @pytest.mark.asyncio
     async def test_requested_concurrency_above_hard_cap_is_clamped(self, tmp_path, run_logger):
+        # A single-item call can't distinguish "clamped" from "not clamped"
+        # (Semaphore(999) and Semaphore(10) behave identically with one item
+        # in flight) - use enough items to actually saturate above the cap
+        # if it weren't being enforced.
+        max_concurrent_seen = 0
+        current_concurrent = 0
+
         def respond(item):
             return f'<result>{{"item": "{item}"}}</result>'
 
         FakeClient, _ = make_fake_client_cls(respond)
-        tool = make_dispatch_tool(tmp_path, run_logger)
 
-        with patch("browser_use_demo.tools.subagent.ClaudeSDKClient", FakeClient), patched_worker_deps():
-            # Should not raise, and should behave as if capped, not as 999
+        class TrackingFakeClient(FakeClient):
+            async def query(self, item):
+                nonlocal max_concurrent_seen, current_concurrent
+                current_concurrent += 1
+                max_concurrent_seen = max(max_concurrent_seen, current_concurrent)
+                await asyncio.sleep(0.02)
+                self._item = item
+                current_concurrent -= 1
+
+        tool = make_dispatch_tool(tmp_path, run_logger)
+        with patch("browser_use_demo.tools.subagent.ClaudeSDKClient", TrackingFakeClient), patched_worker_deps():
             await tool(
                 shared_instructions="x",
-                items=["a"],
+                items=[f"item_{i}" for i in range(MAX_CONCURRENCY_HARD_CAP + 10)],
                 output_schema={},
                 max_concurrency=999,
             )
-        # No direct way to observe the clamp with only 1 item other than
-        # confirming the constant itself is sane and used - covered by
-        # test_default_concurrency_used_when_not_specified for behavior;
-        # this test just guards against a crash on out-of-range input.
-        assert MAX_CONCURRENCY_HARD_CAP == 10
+
+        assert max_concurrent_seen <= MAX_CONCURRENCY_HARD_CAP
 
 
 class TestResultAggregation:

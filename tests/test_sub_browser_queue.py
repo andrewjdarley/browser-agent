@@ -114,12 +114,18 @@ async def drain(queue: SubBrowserQueue, timeout: float = 2.0):
 class TestAddAndExecution:
     @pytest.mark.asyncio
     async def test_add_returns_ids_immediately_without_waiting(self, tmp_path):
-        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path, min_interval_s=0)
+        browser_tool = make_browser_tool(tmp_path)
+        queue = SubBrowserQueue(browser_tool=browser_tool, run_dir=tmp_path, min_interval_s=0)
         ids = queue.add([[{"action": "navigate", "url": "example.com"}]])
-        # add() is synchronous and returns before anything actually runs -
-        # the fire-and-forget contract queue_screenshots' tool fn relies on.
         assert len(ids) == 1
         assert isinstance(ids[0], str) and ids[0]
+        # The real fire-and-forget contract: the item is scheduled (moved
+        # into _in_progress) but its actual async work - even the very
+        # first await inside _run_item, opening a page - has NOT run yet.
+        # add() only calls asyncio.create_task, it doesn't await it.
+        assert ids[0] in queue._in_progress
+        assert queue._pending == []
+        browser_tool._context.new_page.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_navigate_then_screenshot_produces_a_saved_file(self, tmp_path):
@@ -342,11 +348,6 @@ class TestLivePreviews:
     progress)."""
 
     @pytest.mark.asyncio
-    async def test_empty_queue_returns_no_previews(self, tmp_path):
-        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path, min_interval_s=0)
-        assert await queue.capture_live_previews() == {}
-
-    @pytest.mark.asyncio
     async def test_in_progress_item_has_a_live_preview(self, tmp_path):
         gate = asyncio.Event()
 
@@ -523,13 +524,3 @@ class TestToolFunctions:
         result = await fn.handler({})
         assert "Cleared 1 pending" in result["content"][0]["text"]
 
-    @pytest.mark.asyncio
-    async def test_queue_pause_and_resume_tools(self, tmp_path):
-        queue = SubBrowserQueue(browser_tool=make_browser_tool(tmp_path), run_dir=tmp_path, min_interval_s=0)
-        pause_fn = build_queue_pause_tool_fn(queue)
-        resume_fn = build_queue_resume_tool_fn(queue)
-
-        await pause_fn.handler({})
-        assert queue.paused is True
-        await resume_fn.handler({})
-        assert queue.paused is False

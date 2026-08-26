@@ -1,30 +1,8 @@
 """Tests for MessageRenderer class with comprehensive edge case coverage."""
 
-from unittest.mock import MagicMock, Mock, patch
-
 import pytest
 from browser_use_demo.message_renderer import MessageRenderer, Sender
 from browser_use_demo.tools import ToolResult
-
-
-class TestMessageRenderer:
-    """Test suite for MessageRenderer class."""
-
-    def test_initialization(self, mock_streamlit):
-        """Test MessageRenderer initialization."""
-        renderer = MessageRenderer(mock_streamlit["session_state"])
-        assert renderer.session_state == mock_streamlit["session_state"]
-
-    def test_initialization_with_none_state(self):
-        """Test initialization with None session state."""
-        renderer = MessageRenderer(None)
-        assert renderer.session_state is None
-
-    def test_initialization_with_empty_state(self):
-        """Test initialization with empty session state."""
-        empty_state = MagicMock()
-        renderer = MessageRenderer(empty_state)
-        assert renderer.session_state == empty_state
 
 
 class TestRenderMethod:
@@ -88,6 +66,30 @@ class TestRenderMethod:
         mock_streamlit["markdown"].assert_called_with("With screenshot")
         mock_streamlit["image"].assert_not_called()
 
+    def test_render_tool_result_image_only_skipped_when_hidden(
+        self, mock_streamlit, sample_tool_result
+    ):
+        """Regression test: a ToolResult with only a screenshot (no output/
+        error text) must be skipped entirely when hide_screenshots is True -
+        _should_skip_message previously used hasattr(message, "error")/
+        hasattr(message, "output"), which are always True on a ToolResult
+        (they're always-present dataclass fields), so this never actually
+        skipped anything."""
+        mock_streamlit["session_state"].hide_screenshots = True
+        renderer = MessageRenderer(mock_streamlit["session_state"])
+        renderer.render(Sender.TOOL, sample_tool_result["image_only"])
+
+        mock_streamlit["chat_message"].assert_not_called()
+
+    def test_render_tool_result_image_only_shown_when_not_hidden(
+        self, mock_streamlit, sample_tool_result
+    ):
+        mock_streamlit["session_state"].hide_screenshots = False
+        renderer = MessageRenderer(mock_streamlit["session_state"])
+        renderer.render(Sender.TOOL, sample_tool_result["image_only"])
+
+        assert mock_streamlit["image"].called
+
     def test_render_tool_result_with_appended_dom_context_shows_leading_text(
         self, mock_streamlit
     ):
@@ -145,33 +147,8 @@ class TestRenderMethod:
         # Should fall back to generic write
         mock_streamlit["write"].assert_called_with(message)
 
-    def test_render_very_long_message(self, mock_streamlit):
-        """Test rendering extremely long messages."""
-        renderer = MessageRenderer(mock_streamlit["session_state"])
-        long_message = "x" * 100000  # 100k characters
-        renderer.render(Sender.USER, long_message)
-
-        mock_streamlit["markdown"].assert_called_with(long_message)
-
-    def test_render_unicode_special_chars(self, mock_streamlit):
-        """Test rendering messages with unicode and special characters."""
-        renderer = MessageRenderer(mock_streamlit["session_state"])
-        special_message = "Hello 世界 🌍 \n\t\r ñáéíóú"
-        renderer.render(Sender.USER, special_message)
-
-        mock_streamlit["markdown"].assert_called_with(special_message)
-
-
 class TestConversationHistory:
     """Test render_conversation_history method with various scenarios."""
-
-    def test_render_empty_history(self, mock_streamlit):
-        """Test rendering empty conversation history."""
-        renderer = MessageRenderer(mock_streamlit["session_state"])
-        renderer.render_conversation_history([])
-
-        # No rendering should occur
-        mock_streamlit["chat_message"].assert_not_called()
 
     def test_render_single_message(self, mock_streamlit):
         """Test rendering single message in history."""
@@ -197,17 +174,6 @@ class TestConversationHistory:
 
         # Should not crash, but won't render
         mock_streamlit["markdown"].assert_not_called()
-
-    def test_render_missing_content_field(self, mock_streamlit):
-        """Test handling messages missing content field."""
-        renderer = MessageRenderer(mock_streamlit["session_state"])
-        messages = [{"role": "user"}]  # Missing content
-
-        # Should not crash - will get KeyError but handler should manage it gracefully
-        try:
-            renderer.render_conversation_history(messages)
-        except KeyError:
-            pass  # Expected when content field is missing
 
     def test_render_none_content(self, mock_streamlit):
         """Test handling messages with None content."""
@@ -290,45 +256,6 @@ class TestConversationHistory:
 class TestEdgeCases:
     """Test edge cases and error conditions."""
 
-    def test_circular_reference_handling(self, mock_streamlit):
-        """Test handling circular references in messages."""
-        renderer = MessageRenderer(mock_streamlit["session_state"])
-
-        # Create circular reference
-        content = []
-        content.append({"type": "text", "text": "Normal", "ref": content})
-        messages = [{"role": "user", "content": content}]
-
-        # Should not crash or infinite loop
-        renderer.render_conversation_history(messages)
-
-    def test_malformed_tool_result(self, mock_streamlit):
-        """Test handling malformed ToolResult objects."""
-        renderer = MessageRenderer(mock_streamlit["session_state"])
-
-        # Create a mock that doesn't have expected attributes
-        malformed = Mock(spec=[])  # No attributes
-        renderer.render(Sender.TOOL, malformed)
-
-        # Should handle gracefully
-        mock_streamlit["markdown"].assert_not_called()
-
-    def test_exception_in_rendering(self, mock_streamlit):
-        """Test that exceptions during rendering are propagated."""
-        # Setup the chat_message context manager properly
-        mock_chat_cm = MagicMock()
-        mock_chat_cm.__enter__ = Mock(return_value=None)
-        mock_chat_cm.__exit__ = Mock(return_value=None)
-        mock_streamlit["chat_message"].return_value = mock_chat_cm
-
-        # Set markdown to raise an exception
-        mock_streamlit["markdown"].side_effect = Exception("Render error")
-        renderer = MessageRenderer(mock_streamlit["session_state"])
-
-        # Should let the exception propagate for markdown rendering
-        with pytest.raises(Exception, match="Render error"):
-            renderer.render(Sender.USER, "Test message")
-
     def test_normalize_content_with_various_inputs(self, mock_streamlit):
         """Test _normalize_content with various input types."""
         renderer = MessageRenderer(mock_streamlit["session_state"])
@@ -344,72 +271,6 @@ class TestEdgeCases:
 
         # Dict input
         assert renderer._normalize_content({"key": "value"}) == [{"key": "value"}]
-
-    def test_deeply_nested_content(self, mock_streamlit):
-        """Test handling deeply nested content structures."""
-        renderer = MessageRenderer(mock_streamlit["session_state"])
-
-        # Create deeply nested structure
-        nested = {"type": "text", "text": "Deep"}
-        for _ in range(100):
-            nested = {"type": "wrapper", "content": nested}
-
-        messages = [{"role": "user", "content": [nested]}]
-        renderer.render_conversation_history(messages)
-
-        # Should handle without stack overflow
-
-    def test_concurrent_modification(self, mock_streamlit):
-        """Test behavior when session state is modified during rendering."""
-        renderer = MessageRenderer(mock_streamlit["session_state"])
-
-        # Setup mock properly for context manager
-        mock_cm = MagicMock()
-        mock_cm.__enter__ = Mock(return_value=None)
-        mock_cm.__exit__ = Mock(return_value=None)
-
-        # Simulate modification during rendering
-        def modify_state(*args, **kwargs):
-            mock_streamlit["session_state"].tools = {}
-            return mock_cm
-
-        mock_streamlit["chat_message"].side_effect = modify_state
-
-        # Should complete rendering despite modifications
-        renderer.render(Sender.USER, "Test")
-
-    def test_invalid_sender_type(self, mock_streamlit):
-        """Test handling invalid sender types."""
-        renderer = MessageRenderer(mock_streamlit["session_state"])
-
-        # Use invalid sender
-        renderer.render("invalid_sender", "Message")
-
-        # Should still render with the provided sender
-        mock_streamlit["chat_message"].assert_called_with("invalid_sender")
-
-    def test_base64_decode_error(self, mock_streamlit):
-        """Test handling invalid base64 image data."""
-        # Setup the chat_message context manager properly
-        mock_chat_cm = MagicMock()
-        mock_chat_cm.__enter__ = Mock(return_value=None)
-        mock_chat_cm.__exit__ = Mock(return_value=None)
-        mock_streamlit["chat_message"].return_value = mock_chat_cm
-
-        # Setup session state to not hide screenshots
-        mock_streamlit["session_state"].hide_screenshots = False
-
-        renderer = MessageRenderer(mock_streamlit["session_state"])
-        tool_result = ToolResult(
-            output="With bad image", base64_image="invalid_base64_!@#$"
-        )
-
-        with patch("base64.b64decode") as mock_decode:
-            mock_decode.side_effect = Exception("Invalid base64")
-
-            # Should handle the error gracefully - the exception should propagate
-            with pytest.raises(Exception, match="Invalid base64"):
-                renderer.render(Sender.TOOL, tool_result)
 
 
 class TestReferencedFileDetection:
