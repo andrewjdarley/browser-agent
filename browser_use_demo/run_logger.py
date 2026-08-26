@@ -1,16 +1,11 @@
-"""Automatic, always-on, per-run action log - distinct from the manual
-"Download Transcript" button in streamlit.py (which stays as a user-triggered,
-full-fidelity, in-memory export) and from the SDK's own low-level session
-JSONL transcripts under ~/.claude/projects/ (an internal implementation
-detail of the Claude Code CLI, not meant for this app to read or rely on).
-
-This one is: written incrementally to run_log.jsonl in the run's output
-directory (so it survives a crash and stays colocated with the run's
-screenshots/artifacts), one compact JSON object per line, driven by SDK
-hooks rather than hand-threaded callbacks.
-
-Never logs base64 image data - screenshots are already on disk (file_path
-covers that); the log stays small and analyzable (e.g. with `jq`).
+"""Automatic, always-on, per-run action log - distinct from streamlit.py's
+manual "Download Transcript" button (a user-triggered, full-fidelity export)
+and the SDK's own internal session JSONL under ~/.claude/projects/ (not
+meant for this app to read or rely on). Written incrementally to
+run_log.jsonl in the run's output directory (survives a crash, colocated
+with the run's screenshots/artifacts), one compact JSON object per line,
+driven by SDK hooks. Never logs base64 image data - screenshots are already
+on disk (file_path covers that) - so the log stays small and jq-able.
 """
 
 import json
