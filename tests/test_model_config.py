@@ -31,10 +31,10 @@ class TestResolve:
 
 
 class TestDefaults:
-    def test_find_model_has_a_sane_non_empty_default(self, monkeypatch):
+    def test_find_model_defaults_to_haiku(self, monkeypatch):
         monkeypatch.delenv("BROWSER_USE_FIND_MODEL", raising=False)
         reloaded = importlib.reload(model_config)
-        assert reloaded.FIND_MODEL
+        assert reloaded.FIND_MODEL == "claude-haiku-4-5-20251001"
 
     def test_subagent_and_verify_model_default_to_none(self, monkeypatch):
         monkeypatch.delenv("BROWSER_USE_SUBAGENT_MODEL", raising=False)

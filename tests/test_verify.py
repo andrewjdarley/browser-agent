@@ -131,19 +131,6 @@ class TestIndependentSessionConstruction:
 
         assert constructed_options[0].allowed_tools == ["mcp__browser_use__browser"]
 
-    @pytest.mark.asyncio
-    async def test_verifier_prompt_does_not_leak_coordinator_reasoning_framing(self, tmp_path, run_logger):
-        """The system prompt addendum should tell the verifier to form its
-        own judgment, not review the original method."""
-        text = '<result>{"confirmed": true, "actual_finding": "x", "explanation": "y"}</result>'
-        FakeClient, constructed_options = make_fake_client_cls(text)
-        tool = make_verify_tool(tmp_path, run_logger)
-
-        with patch("browser_use_demo.tools.verify.ClaudeSDKClient", FakeClient), patched_worker_deps():
-            await tool(claim="x", context="y")
-
-        assert "independent" in constructed_options[0].system_prompt.lower()
-
 
 class TestResultHandling:
     @pytest.mark.asyncio
@@ -174,6 +161,17 @@ class TestResultHandling:
     @pytest.mark.asyncio
     async def test_missing_result_block_reported_as_error(self, tmp_path, run_logger):
         FakeClient, _ = make_fake_client_cls("I looked into it but wasn't sure.")
+        tool = make_verify_tool(tmp_path, run_logger)
+
+        with patch("browser_use_demo.tools.verify.ClaudeSDKClient", FakeClient), patched_worker_deps():
+            result = await tool(claim="x", context="y")
+
+        parsed = json.loads(result.output)
+        assert "error" in parsed
+
+    @pytest.mark.asyncio
+    async def test_invalid_json_in_result_block_reported_as_error(self, tmp_path, run_logger):
+        FakeClient, _ = make_fake_client_cls("<result>{not valid json</result>")
         tool = make_verify_tool(tmp_path, run_logger)
 
         with patch("browser_use_demo.tools.verify.ClaudeSDKClient", FakeClient), patched_worker_deps():

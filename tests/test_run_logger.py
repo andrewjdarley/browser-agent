@@ -30,11 +30,6 @@ class TestRunLoggerBasics:
         events = read_events(tmp_path)
         assert [e["event"] for e in events] == ["run_start", "error", "run_end"]
 
-    def test_never_logs_base64_image_data(self, tmp_path):
-        logger = RunLogger(tmp_path)
-        logger.log_run_start(model="m")
-        raw_log = (tmp_path / "run_log.jsonl").read_text()
-        assert "base64" not in raw_log.lower() or "base64_image" not in raw_log
 
 
 class TestRunLoggerHooks:
@@ -79,6 +74,35 @@ class TestRunLoggerHooks:
         events = read_events(tmp_path)
         assert events[0]["output_summary"] == "Saved file: out.csv"
         assert events[0]["has_image"] is False
+
+    @pytest.mark.asyncio
+    async def test_never_logs_base64_image_data(self, tmp_path):
+        logger = RunLogger(tmp_path)
+        input_data = {
+            "tool_use_id": "abc123",
+            "tool_name": "mcp__browser_use__browser",
+            "tool_response": [
+                {"type": "image", "source": {"type": "base64", "data": "a" * 5000}}
+            ],
+        }
+        await logger.on_post_tool_use(input_data, "abc123", None)
+        raw_log = (tmp_path / "run_log.jsonl").read_text()
+        assert "a" * 5000 not in raw_log
+        events = read_events(tmp_path)
+        assert events[0]["has_image"] is True
+
+    @pytest.mark.asyncio
+    async def test_post_tool_use_hook_truncates_long_text_summary(self, tmp_path):
+        logger = RunLogger(tmp_path)
+        long_text = "x" * 500
+        input_data = {
+            "tool_use_id": "abc123",
+            "tool_name": "mcp__browser_use__get_page_text",
+            "tool_response": [{"type": "text", "text": long_text}],
+        }
+        await logger.on_post_tool_use(input_data, "abc123", None)
+        events = read_events(tmp_path)
+        assert events[0]["output_summary"] == "x" * 200 + "..."
 
     @pytest.mark.asyncio
     async def test_user_prompt_submit_hook(self, tmp_path):
