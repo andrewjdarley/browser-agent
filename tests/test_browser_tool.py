@@ -397,15 +397,9 @@ def _make_element_info(**overrides):
 class TestOutline:
     """outline(ref) draws a bounding box around an element and screenshots
     it - a visual complement to find/execute_js for confirming a ref really
-    points at the element it claims to (find's own tool description used to
-    claim it did this highlighting; it never actually did - see the fixed
-    action description in the schema).
-
-    Named "outline", not "highlight" - a real run showed the model
-    conflating the tool with a task's own use of "highlight" (a Wikipedia
-    page's native highlighted-section behavior), reimplementing this exact
-    box-drawing pattern by hand against the wrong element instead of
-    searching the page for what the task meant."""
+    points at the element it claims to. Named "outline", not "highlight",
+    to avoid the model confusing this action with a task's own use of that
+    word - see test_loop.py's highlight->outline rename regression guard."""
 
     @pytest.mark.asyncio
     async def test_draws_box_screenshots_and_removes_it(self, tmp_path):

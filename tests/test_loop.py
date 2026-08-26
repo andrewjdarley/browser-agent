@@ -107,19 +107,10 @@ class TestBuildOptions:
         assert "batch_extract" in BROWSER_SYSTEM_PROMPT
 
     def test_prompt_forks_run_script_vs_queue_screenshots_on_scale(self):
-        # Regression guard, in two parts. First: a real run asked for
-        # "full-page screenshot of the 25 most recent merged PRs" (screenshot
-        # only, no data extraction) and the agent used run_script, not
-        # queue_screenshots - initially read as a miss, but on reflection a
-        # batch of 25 that finishes in well under a minute is exactly where
-        # run_script's simpler blocking-then-one-result model is the right
-        # call, not queue_screenshots' extra moving parts (a queue, a live
-        # panel, separate status polling). Second: queue_screenshots' actual
-        # value - live visibility into a long-running batch without a human
-        # sitting on one giant blocking call - only pays for itself at real
-        # scale, so the guidance needs an explicit scale threshold (roughly
-        # 100+ items) rather than "screenshot-only, always prefer
-        # queue_screenshots" full stop.
+        # Regression guard: the prompt must fork run_script vs
+        # queue_screenshots on batch SCALE (roughly 100+ items), not just
+        # "screenshot-only, always prefer queue_screenshots" - a small batch
+        # doesn't need the extra moving parts (a queue, a live panel).
         assert "roughly 100+ items" in BROWSER_SYSTEM_PROMPT
         assert "run_script's simplicity is the better trade" in BROWSER_SYSTEM_PROMPT
         # The scale fork must appear before run_script's own pitch, not
