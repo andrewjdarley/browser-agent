@@ -12,6 +12,7 @@ import json
 import os
 import sys
 from collections import Counter, deque
+from itertools import count
 from pathlib import Path
 from typing import Any, Literal, Optional, TypedDict
 from urllib.parse import urlparse
@@ -211,6 +212,165 @@ NETWORK_BODY_CONTENT_TYPE_PREFIXES = ("application/json", "application/xml", "te
 # A single captured body larger than this gets truncated - context-size
 # control, same reasoning as DOM_DIFF_MAX_CHARS below.
 MAX_NETWORK_BODY_CHARS = 20000
+
+
+def capture_network_response(response, log: "deque[NetworkLogEntry]", counter: "count") -> None:
+    """Synchronous capture of one response into `log`, id-tagged from
+    `counter`. Module-level (not bound to a BrowserTool instance) so it can
+    be attached to any page/log pair - BrowserTool's own single-page capture
+    uses its own self._network_log/self._network_log_counter, and
+    run_script's per-item pages use a fresh log/counter per item (see
+    script_runner.py) - the capture and entry shape are identical either
+    way, only which log/page they're bound to differs.
+
+    Playwright event handlers are invoked synchronously (not awaited), so
+    this only does synchronous work (response.status/.headers and
+    request.method/.resource_type are all available without an await); the
+    body - which does need an await - is captured separately via a
+    scheduled task (capture_network_response_body), only for content-types
+    worth reading as text. Never lets a logging failure break the actual
+    page interaction that triggered the request.
+    """
+    try:
+        request = response.request
+        content_type = response.headers.get("content-type", "")
+        entry: NetworkLogEntry = {
+            "id": f"n{next(counter)}",
+            "url": response.url,
+            "method": request.method,
+            "status": response.status,
+            "resource_type": request.resource_type,
+            "content_type": content_type,
+            "body": None,
+            "body_truncated": False,
+        }
+        log.append(entry)
+        if content_type.startswith(NETWORK_BODY_CONTENT_TYPE_PREFIXES):
+            asyncio.create_task(capture_network_response_body(entry, response))
+    except Exception:
+        pass
+
+
+async def capture_network_response_body(entry: "NetworkLogEntry", response) -> None:
+    """Fills in entry["body"] after the fact - response.text() needs an
+    await, so this runs as a separate task scheduled from the sync
+    capture_network_response handler. If the entry has already aged out of
+    its log (evicted by the deque's maxlen) by the time this completes, the
+    update is harmless - just wasted work on a dict nothing references
+    anymore."""
+    try:
+        body = await response.text()
+    except Exception:
+        # Body already consumed, non-text encoding, connection closed
+        # before it could be read, etc. - leave body as None; network_inspect
+        # reports this as "not captured" rather than erroring.
+        return
+    if len(body) > MAX_NETWORK_BODY_CHARS:
+        entry["body"] = body[:MAX_NETWORK_BODY_CHARS]
+        entry["body_truncated"] = True
+    else:
+        entry["body"] = body
+
+
+def network_list_types_text(log: "deque[NetworkLogEntry]") -> str:
+    """A first-glance map of captured traffic - counts by resource type and
+    by host - before drilling in with network_list_text/network_inspect_text.
+    Deliberately not a full request dump; see those two for that."""
+    if not log:
+        return (
+            "No network activity captured yet - responses are only logged from when the "
+            "browser session started, so navigate somewhere first."
+        )
+
+    by_type = Counter(e["resource_type"] or "unknown" for e in log)
+    by_host = Counter(urlparse(e["url"]).netloc for e in log)
+
+    lines = [f"{len(log)} response(s) captured this session.", "", "By resource type:"]
+    for rtype, count_ in by_type.most_common():
+        lines.append(f"  {rtype}: {count_}")
+    lines.append("")
+    lines.append("By host:")
+    for host, count_ in by_host.most_common(15):
+        lines.append(f"  {host}: {count_}")
+    if len(by_host) > 15:
+        lines.append(f"  ... and {len(by_host) - 15} more host(s)")
+    return "\n".join(lines)
+
+
+def network_list_text(log: "deque[NetworkLogEntry]", match: Optional[str]) -> str:
+    """List captured responses, most recent first, optionally filtered by a
+    substring match against URL, method, resource type, or an exact status
+    code. Capped at MAX_NETWORK_LIST_RESULTS - narrow the match to see more
+    specific results rather than relying on this to surface everything at
+    once (the whole reason this is split from network_list_types_text: a
+    page can fire hundreds of requests, most of them irrelevant to what
+    you're actually looking for)."""
+    entries = list(log)
+    if match:
+        match_lower = match.lower()
+        entries = [
+            e
+            for e in entries
+            if match_lower in e["url"].lower()
+            or match_lower in e["method"].lower()
+            or match_lower in (e["resource_type"] or "").lower()
+            or match_lower == str(e["status"])
+        ]
+
+    if not entries:
+        if match:
+            return f"No captured responses matched {match!r}."
+        return "No network activity captured yet."
+
+    total = len(entries)
+    shown = entries[-MAX_NETWORK_LIST_RESULTS:]
+    header = f"{total} matching response(s)"
+    if match:
+        header += f" for {match!r}"
+    header += f", showing {len(shown)} most recent:"
+    lines = [header, ""]
+    for e in shown:
+        body_note = ""
+        if e["body"] is not None:
+            body_note = " [body captured, truncated]" if e["body_truncated"] else " [body captured]"
+        lines.append(f"{e['id']} | {e['status']} {e['method']} {e['resource_type']} | {e['url']}{body_note}")
+    if total > len(shown):
+        lines.append(f"... {total - len(shown)} more not shown - narrow your match to see them")
+    return "\n".join(lines)
+
+
+def network_inspect_text(log: "deque[NetworkLogEntry]", entry_id: str) -> str:
+    """Full detail (status, headers summary, body if captured) for one
+    specific response, by the id shown in network_list_text's output.
+    Raises ToolError if the id isn't found."""
+    entry = next((e for e in log if e["id"] == entry_id), None)
+    if entry is None:
+        raise ToolError(
+            f"No captured response with id {entry_id!r} - call network_list first to "
+            f"find a valid id (only the most recent {MAX_NETWORK_LOG_ENTRIES} responses "
+            "this session are kept)."
+        )
+
+    lines = [
+        f"{entry['method']} {entry['url']}",
+        f"Status: {entry['status']}",
+        f"Resource type: {entry['resource_type']}",
+        f"Content-Type: {entry['content_type'] or '(none)'}",
+        "",
+    ]
+    if entry["body"] is not None:
+        lines.append("Body:")
+        lines.append(entry["body"])
+        if entry["body_truncated"]:
+            lines.append(f"\n[truncated at {MAX_NETWORK_BODY_CHARS} chars]")
+    else:
+        lines.append(
+            "Body: not captured. Only JSON/XML/text/HTML responses are captured "
+            "automatically (binary/image/font/media responses are skipped by design); "
+            "a body can also be briefly unavailable if the response hadn't finished "
+            "loading yet when this was logged - try again in a moment."
+        )
+    return "\n".join(lines)
 
 
 Actions = Literal[
@@ -447,7 +607,7 @@ class BrowserTool:
         # navigate) so a request made just before navigating away is still
         # inspectable afterward.
         self._network_log: "deque[NetworkLogEntry]" = deque(maxlen=MAX_NETWORK_LOG_ENTRIES)
-        self._network_log_counter = 0
+        self._network_log_counter = count(1)
 
     @property
     def options(self) -> BrowserOptions:
@@ -1230,153 +1390,23 @@ Source element: <{result.get("source", "unknown")}>
     def _on_network_response(self, response) -> None:
         """Passive capture of every response, for the network_list_types/
         network_list/network_inspect actions. Registered once per page via
-        page.on("response", ...) in _ensure_browser.
-
-        Playwright event handlers are invoked synchronously (not awaited), so
-        this only does synchronous work (response.status/.headers and
-        request.method/.resource_type are all available without an await);
-        the body - which does need an await - is captured separately via a
-        scheduled task in _capture_network_body, only for content-types
-        worth reading as text. Never lets a logging failure break the actual
-        page interaction that triggered the request.
-        """
-        try:
-            request = response.request
-            self._network_log_counter += 1
-            content_type = response.headers.get("content-type", "")
-            entry: NetworkLogEntry = {
-                "id": f"n{self._network_log_counter}",
-                "url": response.url,
-                "method": request.method,
-                "status": response.status,
-                "resource_type": request.resource_type,
-                "content_type": content_type,
-                "body": None,
-                "body_truncated": False,
-            }
-            self._network_log.append(entry)
-            if content_type.startswith(NETWORK_BODY_CONTENT_TYPE_PREFIXES):
-                asyncio.create_task(self._capture_network_body(entry, response))
-        except Exception:
-            pass
+        page.on("response", ...) in _ensure_browser. Delegates to the
+        module-level capture_network_response - see its docstring for why
+        this logic lives outside the class (run_script's per-item pages
+        reuse it against their own log, see script_runner.py)."""
+        capture_network_response(response, self._network_log, self._network_log_counter)
 
     async def _capture_network_body(self, entry: NetworkLogEntry, response) -> None:
-        """Fills in entry["body"] after the fact - response.text() needs an
-        await, so this runs as a separate task scheduled from the sync
-        _on_network_response handler. If the entry has already aged out of
-        _network_log (evicted by the deque's maxlen) by the time this
-        completes, the update is harmless - just wasted work on a dict
-        nothing references anymore."""
-        try:
-            body = await response.text()
-        except Exception:
-            # Body already consumed, non-text encoding, connection closed
-            # before it could be read, etc. - leave body as None; network_inspect
-            # reports this as "not captured" rather than erroring.
-            return
-        if len(body) > MAX_NETWORK_BODY_CHARS:
-            entry["body"] = body[:MAX_NETWORK_BODY_CHARS]
-            entry["body_truncated"] = True
-        else:
-            entry["body"] = body
+        await capture_network_response_body(entry, response)
 
     async def _network_list_types(self) -> ToolResult:
-        """A first-glance map of the page's traffic - counts by resource
-        type and by host - before drilling in with network_list/
-        network_inspect. Deliberately not a full request dump; see those
-        two actions for that."""
-        if not self._network_log:
-            return ToolResult(
-                output="No network activity captured yet - responses are only logged from "
-                "when the browser session started, so navigate somewhere first."
-            )
-
-        by_type = Counter(e["resource_type"] or "unknown" for e in self._network_log)
-        by_host = Counter(urlparse(e["url"]).netloc for e in self._network_log)
-
-        lines = [f"{len(self._network_log)} response(s) captured this session.", "", "By resource type:"]
-        for rtype, count in by_type.most_common():
-            lines.append(f"  {rtype}: {count}")
-        lines.append("")
-        lines.append("By host:")
-        for host, count in by_host.most_common(15):
-            lines.append(f"  {host}: {count}")
-        if len(by_host) > 15:
-            lines.append(f"  ... and {len(by_host) - 15} more host(s)")
-        return ToolResult(output="\n".join(lines))
+        return ToolResult(output=network_list_types_text(self._network_log))
 
     async def _network_list(self, match: Optional[str]) -> ToolResult:
-        """List captured responses, most recent first, optionally filtered
-        by a substring match against URL, method, resource type, or an
-        exact status code. Capped at MAX_NETWORK_LIST_RESULTS - narrow the
-        match to see more specific results rather than relying on this to
-        surface everything at once (the whole reason this is split from
-        network_list_types: a page can fire hundreds of requests, most of
-        them irrelevant to what you're actually looking for)."""
-        entries = list(self._network_log)
-        if match:
-            match_lower = match.lower()
-            entries = [
-                e
-                for e in entries
-                if match_lower in e["url"].lower()
-                or match_lower in e["method"].lower()
-                or match_lower in (e["resource_type"] or "").lower()
-                or match_lower == str(e["status"])
-            ]
-
-        if not entries:
-            if match:
-                return ToolResult(output=f"No captured responses matched {match!r}.")
-            return ToolResult(output="No network activity captured yet.")
-
-        total = len(entries)
-        shown = entries[-MAX_NETWORK_LIST_RESULTS:]
-        header = f"{total} matching response(s)"
-        if match:
-            header += f" for {match!r}"
-        header += f", showing {len(shown)} most recent:"
-        lines = [header, ""]
-        for e in shown:
-            body_note = ""
-            if e["body"] is not None:
-                body_note = " [body captured, truncated]" if e["body_truncated"] else " [body captured]"
-            lines.append(f"{e['id']} | {e['status']} {e['method']} {e['resource_type']} | {e['url']}{body_note}")
-        if total > len(shown):
-            lines.append(f"... {total - len(shown)} more not shown - narrow your match to see them")
-        return ToolResult(output="\n".join(lines))
+        return ToolResult(output=network_list_text(self._network_log, match))
 
     async def _network_inspect(self, entry_id: str) -> ToolResult:
-        """Full detail (status, headers summary, body if captured) for one
-        specific response, by the id shown in network_list's output."""
-        entry = next((e for e in self._network_log if e["id"] == entry_id), None)
-        if entry is None:
-            raise ToolError(
-                f"No captured response with id {entry_id!r} - call network_list first to "
-                f"find a valid id (only the most recent {MAX_NETWORK_LOG_ENTRIES} responses "
-                "this session are kept)."
-            )
-
-        lines = [
-            f"{entry['method']} {entry['url']}",
-            f"Status: {entry['status']}",
-            f"Resource type: {entry['resource_type']}",
-            f"Content-Type: {entry['content_type'] or '(none)'}",
-            "",
-        ]
-        if entry["body"] is not None:
-            lines.append("Body:")
-            lines.append(entry["body"])
-            if entry["body_truncated"]:
-                lines.append(f"\n[truncated at {MAX_NETWORK_BODY_CHARS} chars]")
-        else:
-            lines.append(
-                "Body: not captured. Only JSON/XML/text/HTML responses are captured "
-                "automatically (binary/image/font/media responses are skipped by design); "
-                "a body can also be briefly unavailable if the response hadn't finished "
-                "loading yet when this was logged - try again in a moment."
-            )
-        return ToolResult(output="\n".join(lines))
+        return ToolResult(output=network_inspect_text(self._network_log, entry_id))
 
     async def _find(self, search_query: str) -> ToolResult:
         """Find elements on the page matching the search query using AI."""

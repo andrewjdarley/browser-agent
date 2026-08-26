@@ -14,6 +14,15 @@ import pytest
 from browser_use_demo.tools.file_output import FileOutputTool
 from browser_use_demo.tools.script_runner import MAX_ATTEMPTS_PER_ITEM, ScriptRunnerTool
 
+# Captured before fast_page_ready_wait (below) patches asyncio.sleep - since
+# asyncio is one shared module object, that patch neuters asyncio.sleep
+# GLOBALLY for the duration of every test in this file, including a bare
+# `await asyncio.sleep(0)` written directly in a test. The network-capture
+# tests below need a REAL yield to let a asyncio.create_task-scheduled body
+# capture actually run before the next script step reads it - this
+# unpatched reference is how they get one.
+_real_asyncio_sleep = asyncio.sleep
+
 
 @pytest.fixture(autouse=True)
 def fast_page_ready_wait():
@@ -34,6 +43,29 @@ class FakeFetchResponse:
     def __init__(self, status=200, body="<html></html>", headers=None):
         self.status = status
         self.headers = headers or {}
+        self._body = body
+
+    async def text(self):
+        return self._body
+
+
+class FakeRequest:
+    def __init__(self, method="GET", resource_type="xhr"):
+        self.method = method
+        self.resource_type = resource_type
+
+
+class FakeNetworkResponse:
+    """Response shape for the page.on("response", ...) capture path - same
+    shape as test_network_inspection.py's FakeResponse (kept as a separate
+    local copy rather than a shared import, matching this file's existing
+    self-contained fake style)."""
+
+    def __init__(self, url, status=200, content_type="application/json", body='{"ok": true}', method="GET"):
+        self.url = url
+        self.status = status
+        self.headers = {"content-type": content_type} if content_type else {}
+        self.request = FakeRequest(method=method)
         self._body = body
 
     async def text(self):
@@ -62,6 +94,18 @@ def make_fake_page(*, goto_status=200, evaluate_result=None, evaluate_side_effec
     page.goto = AsyncMock(side_effect=goto)
     page.screenshot = AsyncMock(side_effect=lambda path, **kw: Path(path).write_bytes(b"\x89PNG\r\n"))
     page.close = AsyncMock()
+
+    # scroll_to's get_by_text(...).first.scroll_into_view_if_needed() chain.
+    scroll_locator = MagicMock()
+    scroll_locator.scroll_into_view_if_needed = AsyncMock()
+    page.get_by_text = MagicMock(return_value=MagicMock(first=scroll_locator))
+
+    # network_* steps' page.on("response", handler) registration - captured
+    # here so a test can fire it manually (a bare MagicMock's .on() doesn't
+    # actually dispatch events the way a real Page would).
+    page._response_handlers = []
+    page.on = MagicMock(side_effect=lambda event, handler: page._response_handlers.append(handler))
+
     return page
 
 
@@ -374,3 +418,193 @@ class TestRateLimitRetry:
         parsed = json.loads(result.output)
         assert parsed["failed"] == 1
         assert f"gave up after {MAX_ATTEMPTS_PER_ITEM} attempts" in parsed["results"][0]["error"]
+
+
+class TestScrollToStep:
+    """scroll_to on the full (navigate) path - a literal-text substring
+    match via page.get_by_text, same mechanism as sub_browser_queue.py's own
+    scroll_to, NOT the ref-based browser-tool action (no read_page/find step
+    exists here to produce a ref)."""
+
+    @pytest.mark.asyncio
+    async def test_scrolls_to_matching_text(self, tmp_path):
+        page = make_fake_page()
+        tool, _ = make_tool(tmp_path, new_page_factory=lambda: page)
+        result = await tool(
+            items=["https://a.test"],
+            script=[{"action": "navigate", "text": "{{item}}"}, {"action": "scroll_to", "text": "Pricing"}],
+        )
+        parsed = json.loads(result.output)
+        assert parsed["succeeded"] == 1
+        page.get_by_text.assert_called_once_with("Pricing", exact=False)
+        page.get_by_text.return_value.first.scroll_into_view_if_needed.assert_awaited_once()
+        assert "Pricing" in parsed["results"][0]["steps"][1]["output"]
+
+    @pytest.mark.asyncio
+    async def test_requires_text_param(self, tmp_path):
+        tool, _ = make_tool(tmp_path, new_page_factory=lambda: make_fake_page())
+        result = await tool(
+            items=["https://a.test"],
+            script=[{"action": "navigate", "text": "{{item}}"}, {"action": "scroll_to"}],
+        )
+        parsed = json.loads(result.output)
+        assert parsed["failed"] == 1
+        assert "scroll_to" in parsed["results"][0]["error"]
+
+    @pytest.mark.asyncio
+    async def test_rejected_in_fast_mode(self, tmp_path):
+        tool, _ = make_tool(tmp_path)
+        result = await tool(items=["https://a.test"], script=[{"action": "scroll_to", "text": "Pricing"}])
+        assert result.error is not None
+        assert "navigate" in result.error
+
+    @pytest.mark.asyncio
+    async def test_no_longer_listed_as_unsupported(self, tmp_path):
+        # Regression guard for the TODO follow-up: scroll_to used to be
+        # explicitly rejected with a "needs its own execution model"-style
+        # error even in full mode - it's now a real supported step.
+        tool, _ = make_tool(tmp_path, new_page_factory=lambda: make_fake_page())
+        result = await tool(
+            items=["https://a.test"],
+            script=[{"action": "navigate", "text": "{{item}}"}, {"action": "scroll_to", "text": "x"}],
+        )
+        assert result.error is None
+
+
+class TestNetworkSteps:
+    """network_list_types/network_list/network_inspect on the full path -
+    each item's own page.on("response", ...) capture into a fresh per-item
+    log, reusing browser.py's own capture_network_response/*_text helpers."""
+
+    @pytest.mark.asyncio
+    async def test_registers_capture_only_when_script_uses_it(self, tmp_path):
+        page = make_fake_page()
+        tool, _ = make_tool(tmp_path, new_page_factory=lambda: page)
+        await tool(
+            items=["https://a.test"],
+            script=[{"action": "navigate", "text": "{{item}}"}, {"action": "screenshot"}],
+        )
+        page.on.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_registers_capture_when_script_uses_network_step(self, tmp_path):
+        page = make_fake_page()
+        tool, _ = make_tool(tmp_path, new_page_factory=lambda: page)
+        result = await tool(
+            items=["https://a.test"],
+            script=[
+                {"action": "navigate", "text": "{{item}}"},
+                {"action": "network_list_types"},
+            ],
+        )
+        page.on.assert_called_once()
+        assert page.on.call_args.args[0] == "response"
+        parsed = json.loads(result.output)
+        # This fake page's goto() never fires a response event, so the
+        # query step correctly sees an empty log - see
+        # test_list_and_inspect_see_a_response_fired_during_navigate below
+        # for the populated-log case.
+        assert "No network activity captured yet" in parsed["results"][0]["steps"][1]["output"]
+
+    @pytest.mark.asyncio
+    async def test_list_and_inspect_see_a_response_fired_during_navigate(self, tmp_path):
+        page = make_fake_page()
+        real_goto = page.goto
+
+        async def goto_and_fire(url, **kwargs):
+            response = await real_goto(url, **kwargs)
+            for handler in page._response_handlers:
+                handler(FakeNetworkResponse("https://a.test/api/data", status=200))
+            # content_type is JSON, so capture_network_response schedules a
+            # body-capture task via asyncio.create_task - give it a turn to
+            # actually run before the next step reads entry["body"] (same
+            # reasoning as test_network_inspection.py's own asyncio.sleep(0)
+            # after firing a fake response; must be the REAL sleep - see
+            # _real_asyncio_sleep's comment up top).
+            await _real_asyncio_sleep(0)
+            return response
+
+        page.goto = AsyncMock(side_effect=goto_and_fire)
+        tool, _ = make_tool(tmp_path, new_page_factory=lambda: page)
+        result = await tool(
+            items=["https://a.test"],
+            script=[
+                {"action": "navigate", "text": "{{item}}"},
+                {"action": "network_list", "text": "api"},
+                {"action": "network_inspect", "text": "n1"},
+            ],
+        )
+        parsed = json.loads(result.output)
+        assert parsed["succeeded"] == 1
+        steps = parsed["results"][0]["steps"]
+        assert "api/data" in steps[1]["output"]
+        assert "n1" in steps[1]["output"]
+        assert "api/data" in steps[2]["output"]
+        assert '{"ok": true}' in steps[2]["output"]
+
+    @pytest.mark.asyncio
+    async def test_network_log_is_isolated_per_item(self, tmp_path):
+        """Each item gets its own fresh page and its own fresh log - a
+        response captured on one item's page must not leak into another's
+        network_list/network_inspect output."""
+
+        def new_page_factory():
+            p = make_fake_page()
+            real_goto = p.goto
+
+            async def goto_and_fire(url, **kwargs):
+                response = await real_goto(url, **kwargs)
+                for handler in p._response_handlers:
+                    handler(FakeNetworkResponse(f"https://a.test/{url.rsplit('/', 1)[-1]}"))
+                await _real_asyncio_sleep(0)  # let the scheduled body-capture task finish
+                return response
+
+            p.goto = AsyncMock(side_effect=goto_and_fire)
+            return p
+
+        tool, _ = make_tool(tmp_path, new_page_factory=new_page_factory)
+        result = await tool(
+            items=["https://a.test/1", "https://a.test/2"],
+            script=[
+                {"action": "navigate", "text": "{{item}}"},
+                {"action": "network_list"},
+            ],
+        )
+        parsed = json.loads(result.output)
+        assert parsed["succeeded"] == 2
+        for item_result in parsed["results"]:
+            list_output = item_result["steps"][1]["output"]
+            # Exactly one captured response per item's own page, not two.
+            assert "1 matching response" in list_output
+
+    @pytest.mark.asyncio
+    async def test_inspect_requires_text_param(self, tmp_path):
+        tool, _ = make_tool(tmp_path, new_page_factory=lambda: make_fake_page())
+        result = await tool(
+            items=["https://a.test"],
+            script=[{"action": "navigate", "text": "{{item}}"}, {"action": "network_inspect"}],
+        )
+        parsed = json.loads(result.output)
+        assert parsed["failed"] == 1
+        assert "network_inspect" in parsed["results"][0]["error"]
+
+    @pytest.mark.asyncio
+    async def test_inspect_unknown_id_isolated_as_step_failure(self, tmp_path):
+        tool, _ = make_tool(tmp_path, new_page_factory=lambda: make_fake_page())
+        result = await tool(
+            items=["https://a.test"],
+            script=[
+                {"action": "navigate", "text": "{{item}}"},
+                {"action": "network_inspect", "text": "n999"},
+            ],
+        )
+        parsed = json.loads(result.output)
+        assert parsed["failed"] == 1
+        assert "n999" in parsed["results"][0]["error"]
+
+    @pytest.mark.asyncio
+    async def test_rejected_in_fast_mode(self, tmp_path):
+        tool, _ = make_tool(tmp_path)
+        result = await tool(items=["https://a.test"], script=[{"action": "network_list_types"}])
+        assert result.error is not None
+        assert "navigate" in result.error
