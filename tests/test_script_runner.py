@@ -12,7 +12,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from browser_use_demo.tools.file_output import FileOutputTool
-from browser_use_demo.tools.script_runner import MAX_ATTEMPTS_PER_ITEM, ScriptRunnerTool
+from browser_use_demo.tools.script_runner import (
+    MAX_ATTEMPTS_PER_ITEM,
+    MAX_CONCURRENCY_HARD_CAP,
+    ScriptRunnerTool,
+)
 
 # Captured before fast_page_ready_wait (below) patches asyncio.sleep - since
 # asyncio is one shared module object, that patch neuters asyncio.sleep
@@ -328,22 +332,27 @@ class TestConcurrencyCap:
         max_concurrent_seen = 0
         current = 0
 
-        def new_page_factory():
-            nonlocal current
-            current += 1
-            return make_fake_page()
-
-        # Simulate overlap by delaying inside navigate.
+        # Simulate overlap by delaying inside navigate. Must be the REAL
+        # sleep (see _real_asyncio_sleep's comment up top) - this file's
+        # fast_page_ready_wait fixture patches asyncio.sleep globally, so a
+        # bare `await asyncio.sleep(...)` here would be neutered into a
+        # no-op too, collapsing every item to strictly sequential execution
+        # (max_concurrent_seen stuck at 1) regardless of the actual
+        # concurrency bound - confirmed by hand: this test silently couldn't
+        # tell "correctly bounded at 3" from "completely serialized" from
+        # "unbounded" until switched to the real sleep.
         async def slow_goto(url, **kwargs):
             nonlocal max_concurrent_seen, current
             max_concurrent_seen = max(max_concurrent_seen, current)
-            await asyncio.sleep(0.02)
+            await _real_asyncio_sleep(0.02)
             response = MagicMock()
             response.status = 200
             response.headers = {}
             return response
 
         def new_page_with_slow_goto():
+            nonlocal current
+            current += 1
             page = make_fake_page()
             page.goto = AsyncMock(side_effect=slow_goto)
 
@@ -360,15 +369,54 @@ class TestConcurrencyCap:
             script=[{"action": "navigate", "text": "{{item}}"}],
             concurrency=3,
         )
-        assert max_concurrent_seen <= 3
+        # Both bounds matter: >=2 proves items actually overlapped (not
+        # silently serialized - see the note above), <=3 proves the
+        # semaphore genuinely bounds it rather than letting all 10 through.
+        assert 2 <= max_concurrent_seen <= 3
 
     @pytest.mark.asyncio
-    async def test_concurrency_above_hard_cap_is_clamped_not_crashing(self, tmp_path):
-        tool, _ = make_tool(tmp_path, new_page_factory=lambda: make_fake_page())
-        result = await tool(
-            items=["https://a.test"], script=[{"action": "navigate", "text": "{{item}}"}], concurrency=9999
+    async def test_concurrency_above_hard_cap_is_actually_clamped(self, tmp_path):
+        # A single-item call can't distinguish "clamped" from "not clamped"
+        # (Semaphore(9999) and Semaphore(10) behave identically with one
+        # item in flight) - use enough items to actually saturate above the
+        # cap if it weren't being enforced. Same pattern as
+        # test_pages_bounded_by_concurrency above, including the real-sleep
+        # requirement.
+        max_concurrent_seen = 0
+        current = 0
+
+        async def slow_goto(url, **kwargs):
+            nonlocal max_concurrent_seen, current
+            max_concurrent_seen = max(max_concurrent_seen, current)
+            await _real_asyncio_sleep(0.02)
+            response = MagicMock()
+            response.status = 200
+            response.headers = {}
+            return response
+
+        def new_page_with_slow_goto():
+            page = make_fake_page()
+            page.goto = AsyncMock(side_effect=slow_goto)
+
+            async def close():
+                nonlocal current
+                current -= 1
+
+            page.close = AsyncMock(side_effect=close)
+            return page
+
+        def new_page_factory():
+            nonlocal current
+            current += 1
+            return new_page_with_slow_goto()
+
+        tool, _ = make_tool(tmp_path, new_page_factory=new_page_factory)
+        await tool(
+            items=[f"https://a.test/{i}" for i in range(MAX_CONCURRENCY_HARD_CAP + 10)],
+            script=[{"action": "navigate", "text": "{{item}}"}],
+            concurrency=9999,
         )
-        assert json.loads(result.output)["succeeded"] == 1
+        assert max_concurrent_seen == MAX_CONCURRENCY_HARD_CAP
 
 
 class TestSaveAs:

@@ -30,8 +30,13 @@ def mock_streamlit(tmp_path):
 
         # Mock other streamlit components
         with patch("streamlit.chat_message") as mock_chat:
-            mock_chat.return_value.__enter__ = Mock()
-            mock_chat.return_value.__exit__ = Mock()
+            mock_chat.return_value.__enter__ = Mock(return_value=None)
+            # Must return a falsy value - a bare Mock() call returns a
+            # truthy Mock, which __exit__ treats as "suppress the
+            # exception," silently swallowing anything raised inside a
+            # `with st.chat_message(...):` block instead of letting it fail
+            # the test.
+            mock_chat.return_value.__exit__ = Mock(return_value=False)
 
             with patch("streamlit.markdown") as mock_markdown:
                 with patch("streamlit.write") as mock_write:

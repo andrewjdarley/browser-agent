@@ -10,6 +10,7 @@ import pytest
 
 from browser_use_demo.tools.batch_extract import (
     MAX_ATTEMPTS_PER_URL,
+    MAX_CONCURRENCY_HARD_CAP,
     AdaptiveRateLimiter,
     BatchExtractTool,
 )
@@ -146,10 +147,31 @@ class TestConcurrencyCap:
         assert max_concurrent_seen <= 3
 
     @pytest.mark.asyncio
-    async def test_concurrency_above_hard_cap_is_clamped_not_crashing(self, tmp_path):
-        tool, _ = make_tool(tmp_path, get_side_effect=lambda url: FakeResponse())
-        result = await tool(urls=["https://a.test"], extract_js="(doc) => true", concurrency=9999)
-        assert json.loads(result.output)["succeeded"] == 1
+    async def test_concurrency_above_hard_cap_is_actually_clamped(self, tmp_path):
+        # A single-item call can't distinguish "clamped" from "not clamped"
+        # (Semaphore(9999) and Semaphore(30) behave identically with one
+        # item in flight) - use enough items to actually saturate above the
+        # cap if it weren't being enforced.
+        max_concurrent_seen = 0
+        current = 0
+
+        async def get(url):
+            nonlocal max_concurrent_seen, current
+            current += 1
+            max_concurrent_seen = max(max_concurrent_seen, current)
+            await asyncio.sleep(0.02)
+            current -= 1
+            return FakeResponse()
+
+        tool, browser_tool = make_tool(tmp_path, get_side_effect=None)
+        browser_tool._context.request.get = AsyncMock(side_effect=get)
+
+        await tool(
+            urls=[f"https://a.test/{i}" for i in range(MAX_CONCURRENCY_HARD_CAP + 10)],
+            extract_js="(doc) => true",
+            concurrency=9999,
+        )
+        assert max_concurrent_seen <= MAX_CONCURRENCY_HARD_CAP
 
 
 class TestSaveAs:

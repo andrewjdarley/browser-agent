@@ -24,10 +24,21 @@ class TestCheckToolCall:
     def test_plain_navigate_is_fine(self):
         assert check_tool_call(BROWSER_TOOL, {"action": "navigate", "text": "https://example.com/profile"}, None) is None
 
-    def test_navigate_to_destructive_path_matches(self):
-        match = check_tool_call(
-            BROWSER_TOOL, {"action": "navigate", "text": "https://example.com/account/delete-confirm"}, None
-        )
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://example.com/account/delete-confirm",
+            "https://example.com/payment/remove-card",
+            "https://example.com/account/deactivate/confirm",
+            "https://example.com/account/unsubscribe_now",
+            "https://example.com/subscription/cancel-now",
+        ],
+    )
+    def test_navigate_to_destructive_path_matches(self, url):
+        # One case per _NAVIGATE_DANGER_RE alternation branch (delete/
+        # remove/deactivate/unsubscribe/cancel) - a regression here (e.g. a
+        # typo'd or dropped branch) would silently let one of these through.
+        match = check_tool_call(BROWSER_TOOL, {"action": "navigate", "text": url}, None)
         assert match is not None
         assert match.rule == "destructive_url_path"
 
@@ -41,8 +52,9 @@ class TestCheckToolCall:
         assert match is not None
         assert match.rule == "non_get_js_request"
 
-    def test_execute_js_delete_fetch_matches(self):
-        js = 'fetch("/api/account", {method: "DELETE"})'
+    @pytest.mark.parametrize("verb", ["PUT", "PATCH", "DELETE"])
+    def test_execute_js_non_get_fetch_verbs_match(self, verb):
+        js = f'fetch("/api/account", {{method: "{verb}"}})'
         match = check_tool_call(BROWSER_TOOL, {"action": "execute_js", "text": js}, None)
         assert match is not None
 
@@ -83,6 +95,56 @@ class TestCheckToolCall:
         # `type` has no `ref` param (types into whatever's focused) - the
         # targeted-label rule only applies to ref-bearing actions.
         assert check_tool_call(BROWSER_TOOL, {"action": "type", "text": "delete everything"}, DOM_SNAPSHOT) is None
+
+    @pytest.mark.parametrize(
+        "label",
+        [
+            "Delete Account",
+            "Remove Card",
+            "Deactivate Account",
+            "Unsubscribe",
+            "Permanently Close Account",
+            "Cancel my subscription",
+            "Cancel the account",
+            "Cancel my order",
+            "Cancel the membership",
+            "Confirm Purchase",
+            "Place Order",
+            "Checkout",
+            "Pay Now",
+            "Submit Payment",
+            "Transfer Funds",
+            "Wire Transfer",
+        ],
+    )
+    def test_every_dangerous_label_keyword_matches(self, label):
+        # One case per _DANGEROUS_LABEL_RE alternation branch. Uses the raw
+        # `text` fallback (no ref/dom_snapshot) rather than building a fake
+        # DOM snapshot per label - this doubles as coverage for that
+        # fallback path itself (see test_label_fallback_to_raw_text_matches
+        # below for the fallback path in isolation).
+        match = check_tool_call(BROWSER_TOOL, {"action": "left_click", "text": label}, None)
+        assert match is not None, f"{label!r} should have matched _DANGEROUS_LABEL_RE"
+        assert match.rule == "destructive_target_label"
+
+    def test_label_fallback_to_raw_text_matches_with_a_ref_but_no_snapshot(self):
+        # The documented fallback case: a ref is given (e.g. a click with
+        # modifier keys) but there's no DOM snapshot to resolve it against -
+        # _ref_context returns "" and the raw `text` param is checked
+        # instead, so this must still catch a dangerous label.
+        match = check_tool_call(
+            BROWSER_TOOL, {"action": "left_click", "ref": "ref_9", "text": "Delete Account"}, None
+        )
+        assert match is not None
+        assert match.rule == "destructive_target_label"
+
+    @pytest.mark.parametrize(
+        "action", ["right_click", "middle_click", "double_click", "triple_click"]
+    )
+    def test_other_targeted_click_types_also_checked(self, action):
+        match = check_tool_call(BROWSER_TOOL, {"action": action, "ref": "ref_9"}, DOM_SNAPSHOT)
+        assert match is not None
+        assert match.rule == "destructive_target_label"
 
 
 class TestFingerprint:
